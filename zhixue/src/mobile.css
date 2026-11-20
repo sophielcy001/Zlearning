@@ -112,6 +112,8 @@ textarea {
 .question { min-width: 0; margin-inline: 0; margin-top: 12px; }
 .question legend { font-weight: 650; padding: 0 4px; }
 .question textarea { margin: 5px 0 0; }
+.review-comparison { margin-top: 12px; overflow-wrap: anywhere; }
+.review-comparison p { margin: 0 0 6px; white-space: pre-wrap; }
 .option { display: flex; gap: 8px; align-items: center; min-height: 44px; }
 .option input { accent-color: var(--accent); }
 .notice.error { display: flex; align-items: flex-start; gap: 7px; background: #fff0ef; color: #8b1e28; padding: 10px; border-radius: 8px; }

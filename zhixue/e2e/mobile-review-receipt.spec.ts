@@ -38,7 +38,8 @@ test('a grading reply arriving late cannot replace the settled review', async ({
         projectTopic: '测试课程', dueOn: '2026-11-20', kind: 'model', groupId: 'round-a', basis: 'first',
         questions: [{ text: '解释原理' }],
       }, room);
-      const review = await saveAnswers(paper!.key, ['离线答案'], 'submit');
+      if (paper?.kind !== 'review') throw new Error('Fixture review was not downloaded');
+      const review = await saveAnswers(paper.key, paper.draft, ['离线答案'], 'submit');
       if (review?.kind !== 'review' || !review.submission) throw new Error('Fixture review did not enter the outbox');
       return { review: review.submission.id };
     }, { workspace, room });

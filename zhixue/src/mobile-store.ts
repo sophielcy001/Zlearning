@@ -300,18 +300,45 @@ export function saveNote(key: string, expected: string, content: string) {
   });
 }
 
-export function saveAnswers(key: string, answers: (Answer | null)[], action?: ReviewChange['action']) {
+export function mergeReviewAnswers(base: ReviewRecord['draft'], edited: ReviewRecord['draft'], saved: ReviewRecord['draft']) {
+  const conflicts: number[] = [];
+  const answers = saved.map((value, index) => {
+    if (edited[index] === base[index]) return value;
+    if (value !== base[index] && value !== edited[index]) conflicts.push(index);
+    return edited[index];
+  });
+  return { answers, conflicts };
+}
+
+export class ReviewDraftConflict extends Error {
+  constructor(readonly saved: ReviewRecord['draft'], readonly conflicts: number[]) {
+    super('本机已保存的题组答案有更新，请核对后保存。');
+  }
+}
+
+export function saveAnswers(
+  key: string, expected: ReviewRecord['draft'], draft: ReviewRecord['draft'],
+  action?: ReviewChange['action'], reviewed: readonly number[] = [],
+) {
   return changeItem(key, entry => {
     if (entry?.kind !== 'review') throw new Error('找不到本机题组。');
     if (entry.submission) {
       if (action) return entry;
       throw new Error('这一轮的作答已提交。');
     }
-    const paper = entry.snapshot;
-    if (!action) return { ...entry, draft: answers };
+    const { answers, conflicts } = mergeReviewAnswers(expected, draft, entry.draft);
+    for (const index of reviewed) {
+      if (entry.draft[index] !== expected[index] && !conflicts.includes(index)) conflicts.push(index);
+    }
+    if (conflicts.length) throw new ReviewDraftConflict(entry.draft, conflicts);
+    // A submission may only include answers the user saw before clicking.
+    if (!action || answers.some((value, index) => value !== draft[index])) {
+      return answers.every((value, index) => value === entry.draft[index]) ? entry : { ...entry, draft: answers };
+    }
     if (action === 'submit' && answers.some(value => value === null || typeof value === 'string' && !value.trim())) {
       throw new Error('请答完本组所有题目。');
     }
+    const paper = entry.snapshot;
     const submission: ReviewChange = {
       id: crypto.randomUUID(), workspace: paper.workspace, kind: 'review', capturedAt: new Date().toISOString(),
       lessonId: paper.lessonId, key: paper.key, round: paper.round, groupId: paper.groupId, basis: paper.basis,

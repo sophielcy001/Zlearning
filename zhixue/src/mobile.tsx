@@ -8,7 +8,8 @@ import { DesktopPairingPanel, PhonePairingPanel } from './mobile-pairing-panel';
 import { OfflineLecture } from './lecture-markdown';
 import { mobileRequest, studyKey, type Answer, type Catalog, type LessonChoice, type LessonSnapshot,
   type Paper, type ReviewChange, type ReviewChoice, type ReviewHistory } from './mobile-data';
-import { downloaded, downloadVersion, hasLocalWork, NoteEditConflict, PairingChanged, phonePair, removeDownload, saveAnswers, saveLesson, saveNote, savePaper, watchPhonePair,
+import { downloaded, downloadVersion, hasLocalWork, mergeReviewAnswers, NoteEditConflict, PairingChanged, phonePair, removeDownload,
+  ReviewDraftConflict, saveAnswers, saveLesson, saveNote, savePaper, watchPhonePair,
   type LessonRecord, type MobilePair, type OfflineRecord, type ReviewRecord } from './mobile-store';
 import { needsSync, synchronize } from './mobile-sync';
 import { clearPhoneNotice, phoneNoticeFromUrl, phoneNoticeMatchesPair, PhonePushSettings, readPhoneNotice, rememberPhoneNotice,
@@ -151,67 +152,98 @@ function Questionnaire({ entry, changed, onBack, beforeLeave, timerControl }: {
   entry: ReviewRecord; changed: (record: OfflineRecord) => void; onBack: () => void; beforeLeave: BeforeLeave;
   timerControl: ReactNode;
 }) {
-  const [answers, setAnswers] = useState(entry.draft);
-  const latestAnswers = useRef(entry.draft);
-  const savedAnswers = useRef(entry.draft);
+  type Editor = { draft: ReviewRecord['draft']; base: ReviewRecord['draft']; comparison?: ReviewDraftConflict };
+  const latest = useRef<Editor>({ draft: entry.draft, base: entry.draft });
+  const [{ draft: answers, base, comparison }, setEditor] = useState(latest.current);
+  const updateEditor = useCallback((state: Editor) => {
+    latest.current = state;
+    setEditor(state);
+  }, []);
   const submittedHere = useRef(false);
   const writeInProgress = useRef<{ action?: ReviewChange['action']; promise: Promise<void> }>(undefined);
   const [writing, setWriting] = useState<'draft' | ReviewChange['action']>();
+  const [confirmSubmission, setConfirmSubmission] = useState(false);
   const save = useAction();
   const paper = entry.snapshot;
   const submitted = !!entry.submission;
-  useUnsavedUnloadGuard(writing !== undefined || (!submitted && answers !== savedAnswers.current));
-  const persist = useCallback(async (action?: ReviewChange['action']) => {
+  useUnsavedUnloadGuard(writing !== undefined || (!submitted && (answers !== base || comparison !== undefined)));
+  const persist = useCallback(async (action?: ReviewChange['action'], resolveComparison = false) => {
     if (writeInProgress.current) return writeInProgress.current.promise;
     if (submitted || submittedHere.current) return;
-    const snapshot = latestAnswers.current;
-    if (!action && snapshot === savedAnswers.current) return;
+    const { draft, base, comparison } = latest.current;
+    if (comparison && !resolveComparison) return;
+    if (!action && !comparison && draft === base) return;
+    const expected = comparison
+      ? base.map((value, index) => comparison.conflicts.includes(index) ? comparison.saved[index] : value)
+      : base;
 
+    setConfirmSubmission(false);
     setWriting(action ?? 'draft');
-    const promise = saveAnswers(entry.key, snapshot, action).then(record => {
-      savedAnswers.current = snapshot;
+    const promise = saveAnswers(entry.key, expected, draft, action, comparison?.conflicts).then(record => {
       if (record?.kind !== 'review') return;
+      const saved = record.draft;
       if (record.submission) {
         submittedHere.current = true;
-        latestAnswers.current = record.draft;
-        setAnswers(record.draft);
+        updateEditor({ draft: saved, base: saved });
+      } else {
+        const pending = mergeReviewAnswers(draft, latest.current.draft, saved);
+        const unchanged = pending.answers.every((value, index) => value === saved[index]);
+        updateEditor({ draft: unchanged ? saved : pending.answers, base: saved,
+          comparison: pending.conflicts.length ? new ReviewDraftConflict(saved, pending.conflicts) : undefined });
+        setConfirmSubmission(action !== undefined);
       }
       changed(record);
+    }).catch(error => {
+      if (!(error instanceof ReviewDraftConflict)) throw error;
+      const current = latest.current;
+      const conflicts = [...new Set([...(comparison?.conflicts ?? []), ...error.conflicts])];
+      updateEditor({ ...current, comparison: new ReviewDraftConflict(error.saved, conflicts) });
     }).finally(() => {
       writeInProgress.current = undefined;
       setWriting(undefined);
     });
     writeInProgress.current = { action, promise };
     return promise;
-  }, [changed, entry.key, submitted]);
-  const saveBeforeLeaving = useCallback(async () => {
-    while (writeInProgress.current || (!submitted && !submittedHere.current && latestAnswers.current !== savedAnswers.current)) {
-      await persist();
+  }, [changed, entry.key, submitted, updateEditor]);
+  const saveBeforeLeaving = useCallback(async (): Promise<void | false> => {
+    while (writeInProgress.current || (!submitted && !submittedHere.current)) {
+      if (writeInProgress.current) await writeInProgress.current.promise;
+      else if (latest.current.comparison) return false;
+      else if (latest.current.draft === latest.current.base) return;
+      else await persist();
     }
   }, [persist, submitted]);
   useEffect(() => {
     beforeLeave.current = saveBeforeLeaving;
     return () => { beforeLeave.current = undefined; };
   }, [beforeLeave, saveBeforeLeaving]);
-  function update(index: number, value: Answer) {
+  function update(index: number, value: Answer | null) {
     if (submitted || submittedHere.current || writeInProgress.current?.action) return;
-    const next = latestAnswers.current.map((item, position) => position === index ? value : item);
-    latestAnswers.current = next;
-    setAnswers(next);
+    const current = latest.current;
+    updateEditor({ ...current, draft: current.draft.map((item, position) => position === index ? value : item) });
   }
   return <section className="study-detail">
     <button type="button" className="link-button" onClick={onBack}><ArrowLeft size={18} />返回复习</button>
     <h2>{paper.title}</h2>
     <p className="subtle">{paper.projectTopic} · 第 {paper.round} 轮</p>
     {timerControl}
-    {paper.questions.map((question, index) => <fieldset key={index} className="study-card question" disabled={submitted || writing === 'submit' || writing === 'unknown'}>
-      <legend>{question.text}</legend>
-      {question.options ? question.options.map((option, position) => <label className="option" key={position}>
-        <input type="radio" name={'question-' + index} checked={answers[index] === position} onChange={() => update(index, position)} />
-        <span>{option}</span>
-      </label>) : <textarea aria-label={'第 ' + (index + 1) + ' 题答案'} rows={4}
-        maxLength={3000} value={typeof answers[index] === 'string' ? answers[index] : ''} onChange={event => update(index, event.target.value)} />}
-    </fieldset>)}
+    {paper.questions.map((question, index) => {
+      const stored = comparison?.saved[index];
+      return <fieldset key={index} className="study-card question" disabled={submitted || writing === 'submit' || writing === 'unknown'}>
+        <legend>{question.text}</legend>
+        {question.options ? question.options.map((option, position) => <label className="option" key={position}>
+          <input type="radio" name={'question-' + index} checked={answers[index] === position} onChange={() => update(index, position)} />
+          <span>{option}</span>
+        </label>) : <textarea aria-label={'第 ' + (index + 1) + ' 题答案'} rows={4}
+          maxLength={3000} value={typeof answers[index] === 'string' ? answers[index] : ''} onChange={event => update(index, event.target.value)} />}
+        {comparison?.conflicts.includes(index) && <div className="review-comparison" role="group" aria-label={'第 ' + (index + 1) + ' 题答案核对'}>
+          <p className="subtle">本机已保存的答案</p>
+          <p>{typeof stored === 'number' ? question.options?.[stored] : stored || '未作答'}</p>
+          <button className="action secondary" type="button" disabled={writing !== undefined}
+            onClick={() => update(index, comparison.saved[index])}>采用本机第 {index + 1} 题答案</button>
+        </div>}
+      </fieldset>;
+    })}
     {entry.submission ? <div className="study-card">
       <ReviewState entry={entry} />
       {entry.reply?.reason && <p>{entry.reply.reason}</p>}
@@ -220,11 +252,17 @@ function Questionnaire({ entry, changed, onBack, beforeLeave, timerControl }: {
         {entry.reply.result.dueOn && <p>下次复习 {entry.reply.result.dueOn}</p>}
       </>}
     </div>
+      : comparison ? <div className="actions">
+        <p role="status">{comparison.message}</p>
+        <button className="action" type="button" disabled={writing !== undefined}
+          onClick={() => { void save.run(() => persist(undefined, true)); }}>保存核对结果</button>
+      </div>
       : <div className="actions">
         <button className="action" type="button" disabled={writing !== undefined} onClick={() => { void save.run(() => persist('submit')); }}>提交作答</button>
         <button className="action secondary" type="button" disabled={writing !== undefined} onClick={() => { void save.run(() => persist()); }}>保存草稿</button>
         <button className="action secondary" type="button" disabled={writing !== undefined} onClick={() => { void save.run(() => persist('unknown')); }}>我不会</button>
       </div>}
+    {confirmSubmission && !submitted && <p role="status">已合并另一页保存的答案，请核对后再提交。</p>}
     <ErrorNote message={save.error} />
   </section>;
 }
@@ -562,9 +600,9 @@ function MobileStudy() {
           return;
         }
         if (lessonId) {
-          if (await showAppointment(lessonId, workspace) === false) throw new Error('请先保存笔记合并结果。');
+          if (await showAppointment(lessonId, workspace) === false) throw new Error('请先核对并保存当前草稿。');
         } else {
-          if (await beforeLeave.current?.() === false) throw new Error('请先保存笔记合并结果。');
+          if (await beforeLeave.current?.() === false) throw new Error('请先核对并保存当前草稿。');
           if (pairingRevision.current !== revision) return;
           setTab('reviews');
           setActive(undefined);

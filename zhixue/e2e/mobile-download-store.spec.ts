@@ -120,7 +120,9 @@ for (const desktop of [false, true]) {
           // A response from before removal cannot overwrite the freshly downloaded record.
           await saveLesson(lesson, undefined, oldLesson);
           await savePaper(paper, undefined, oldPaper);
-          await saveAnswers(paperKey, ['本机未同步答案']);
+          const keptPaper = (await downloaded()).find(item => item.key === paperKey);
+          if (keptPaper?.kind !== 'review') throw new Error('Expected the downloaded review');
+          await saveAnswers(paperKey, keptPaper.draft, ['本机未同步答案']);
           let draftProtected = false;
           try { await removeDownload(paperKey); }
           catch (error) { draftProtected = error instanceof Error && error.message.includes('本机草稿'); }
