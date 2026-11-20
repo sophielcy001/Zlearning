@@ -1,0 +1,17 @@
+{
+  "productName": "Zhixue Tauri",
+  "identifier": "local.zhixue.desktop.tauri",
+  "bundle": {
+    "active": true,
+    "icon": [
+      "../release/icons/32x32.png",
+      "../release/icons/128x128.png",
+      "../release/icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "externalBin": ["../release/service/zhixue-service"],
+    "windows": {
+      "webviewInstallMode": { "type": "offlineInstaller", "silent": true }
+    }
+  }
+}

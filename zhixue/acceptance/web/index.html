@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>智学独立验收</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="shell brand">
+      <span class="brand-mark" aria-hidden="true">智</span>
+      <span>智学</span>
+      <span class="brand-section">独立验收</span>
+    </div>
+  </header>
+  <main class="shell">
+    <section class="overview" aria-labelledby="page-title">
+      <div>
+        <h1 id="page-title">智学独立验收</h1>
+        <p>核心验收使用本机模拟接口。真实模型联调需确认调用范围与可能的费用。</p>
+      </div>
+      <div class="overview-actions">
+        <button id="start-run" class="primary" disabled>运行核心验收</button>
+        <button id="start-live" class="secondary" disabled>联调真实模型</button>
+      </div>
+    </section>
+    <p id="message" class="alert" role="alert" hidden></p>
+    <div class="workspace">
+      <aside class="history surface" aria-labelledby="history-title">
+        <h2 id="history-title">运行历史</h2>
+        <p id="history-empty" class="quiet">暂无运行记录</p>
+        <ol id="history-list" class="history-list"></ol>
+      </aside>
+      <section class="run surface" aria-labelledby="run-title">
+        <header class="run-header">
+          <div>
+            <h2 id="run-title">验收流程</h2>
+            <p id="run-description" class="quiet">选择流程节点查看要求和当次记录。</p>
+            <p id="run-reason" class="error-text" hidden></p>
+          </div>
+          <div class="run-actions">
+            <span id="run-status" class="badge" role="status" hidden></span>
+            <button id="open-quality" class="secondary" hidden>查看人工抽查</button>
+            <button id="download" class="secondary" disabled>导出报告</button>
+            <button id="download-billing" class="secondary" hidden>导出账单核对表</button>
+          </div>
+        </header>
+        <div class="run-layout">
+          <nav id="flow" class="flow" aria-labelledby="flow-title" tabindex="-1">
+            <h3 id="flow-title">流程节点</h3>
+            <ol id="flow-list" class="flow-list"></ol>
+          </nav>
+          <section id="inspect" class="inspect" aria-labelledby="step-title" tabindex="-1">
+            <div class="detail-header">
+              <div>
+                <h3 id="step-title">节点详情</h3>
+                <p id="step-design" class="quiet"></p>
+              </div>
+              <span id="step-status" class="badge" hidden></span>
+            </div>
+            <p id="unverified" class="empty-detail quiet">运行后可以查看实际证据。</p>
+            <section id="evidence" class="evidence" aria-labelledby="evidence-title" hidden>
+              <h4 id="evidence-title">实际运行</h4>
+              <dl class="measurements">
+                <div><dt>开始</dt><dd id="step-start"></dd></div>
+                <div><dt>耗时</dt><dd id="step-elapsed"></dd></div>
+              </dl>
+              <p id="step-reason" class="error-text" hidden></p>
+              <h5>输入摘要</h5>
+              <dl id="step-input" class="fields"></dl>
+              <h5>输出</h5>
+              <dl id="step-output" class="fields"></dl>
+            </section>
+            <section id="quality" class="quality" aria-labelledby="quality-title" hidden>
+              <h4 id="quality-title">人工抽查</h4>
+              <p id="quality-status" class="quiet" role="status"></p>
+              <a id="quality-source" target="_blank" rel="noopener noreferrer">查看原始资料</a>
+              <form id="quality-form">
+                <div id="quality-checks" class="quality-checks"></div>
+                <button id="save-quality" class="secondary">保存抽查结论</button>
+              </form>
+            </section>
+            <footer id="playback" class="playback" hidden>
+              <label for="timepoint">按实际执行顺序回看</label>
+              <select id="timepoint"></select>
+              <div class="playback-actions">
+                <button id="previous" class="secondary">上一节点</button>
+                <button id="next" class="secondary">下一节点</button>
+              </div>
+            </footer>
+            <a class="back" href="#flow">返回流程节点</a>
+          </section>
+        </div>
+      </section>
+    </div>
+  </main>
+  <dialog id="live-dialog" class="live-dialog" aria-labelledby="live-title">
+    <form id="live-form" autocomplete="off">
+      <header class="live-header">
+        <h2 id="live-title">联调真实模型</h2>
+        <p id="live-cost" class="quiet"></p>
+      </header>
+      <label class="live-field" for="live-sample">验收样本
+        <select id="live-sample" required></select>
+      </label>
+      <details class="live-scope">
+        <summary>查看发送范围和公开资料</summary>
+        <dl id="live-scope-fields" class="fields"></dl>
+      </details>
+      <div id="live-profiles" class="live-profiles"></div>
+      <details class="live-scope">
+        <summary>配置本次金额上限（可选）</summary>
+        <p class="quiet">发送前按填写的单价预留金额。实际费用以服务商账单为准。</p>
+        <label class="live-field" for="live-limit-amount">本次金额上限
+          <input id="live-limit-amount" inputmode="decimal" maxlength="15" placeholder="留空时按次数控制">
+        </label>
+        <fieldset id="live-budget-rates" class="live-profile" disabled>
+          <legend>联调使用的单价</legend>
+          <label class="live-field" for="live-limit-currency">币种（三位代码）
+            <input id="live-limit-currency" value="CNY" maxlength="3" required>
+          </label>
+          <div class="live-profiles">
+            <fieldset class="live-profile">
+              <legend>主模型单价</legend>
+              <label class="live-field" for="live-main-input-price">每百万输入 token
+                <input id="live-main-input-price" inputmode="decimal" maxlength="15" required>
+              </label>
+              <label class="live-field" for="live-main-output-price">每百万输出 token
+                <input id="live-main-output-price" inputmode="decimal" maxlength="15" required>
+              </label>
+            </fieldset>
+            <fieldset class="live-profile">
+              <legend>独立复核模型单价</legend>
+              <label class="live-field" for="live-review-input-price">每百万输入 token
+                <input id="live-review-input-price" inputmode="decimal" maxlength="15" required>
+              </label>
+              <label class="live-field" for="live-review-output-price">每百万输出 token
+                <input id="live-review-output-price" inputmode="decimal" maxlength="15" required>
+              </label>
+            </fieldset>
+          </div>
+        </fieldset>
+      </details>
+      <label class="live-confirm">
+        <input id="live-consent" type="checkbox" required>
+        <span>我同意向以上模型发送样本数据，并确认服务商可能计费。</span>
+      </label>
+      <p id="live-error" class="error-text" role="alert" hidden></p>
+      <div class="live-actions">
+        <button id="cancel-live" class="secondary" type="button">取消</button>
+        <button id="confirm-live" class="primary" disabled>确认发送并开始联调</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

@@ -1,0 +1,40 @@
+[project]
+name = "zhixue-demo"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "alembic>=1.16,<2",
+    "certifi>=2024.8.30",
+    "cryptography>=45,<52",
+    "fastapi>=0.116,<1",
+    "http-ece>=1.2,<2",
+    "idna>=3.10,<4",
+    "keyring>=25.6,<26",
+    "lxml>=6,<7",
+    "markdown-it-py>=4,<5",
+    "mdit-py-plugins>=0.5,<1",
+    "numpy>=2,<3",
+    "onnxruntime==1.23.2; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "onnxruntime==1.24.4; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "pillow>=13,<14",
+    "pymupdf>=1.26,<2",
+    "python-docx>=1.2,<2",
+    "pywhispercpp>=1.5.1,<2",
+    "sqlalchemy>=2.0,<2.1",
+    "tokenizers==0.22.2",
+    "tzdata>=2025.2",
+    "urllib3>=2.8,<3",
+    "uvicorn>=0.34,<1",
+]
+
+[dependency-groups]
+dev = ["httpx2>=2,<3", "pytest>=8,<10"]
+mobile-relay = ["cryptography>=45,<52", "fastapi>=0.116,<1", "uvicorn>=0.34,<1"]
+packaging = ["pyinstaller==6.22.3"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

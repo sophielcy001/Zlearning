@@ -1,0 +1,11 @@
+.venv/
+.tooling/
+node_modules/
+dist/
+data/
+__pycache__/
+.pytest_cache/
+test-results/
+playwright-report/
+src-tauri/target/
+src-tauri/gen/

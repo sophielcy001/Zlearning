@@ -1,0 +1,13 @@
+{
+  "productName": "智学 Tauri 原型",
+  "version": "0.1.0",
+  "identifier": "local.zhixue.demo.tauri",
+  "app": {
+    "windows": [],
+    "security": { "capabilities": [] }
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["../public/zhixue.png", "icons/icon.ico"]
+  }
+}
