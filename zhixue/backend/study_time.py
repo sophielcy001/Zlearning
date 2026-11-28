@@ -24,15 +24,19 @@ def record_span(db: Session, timer: Timer, seconds: int) -> None:
     record_interval(db, timer, start, end, timer.started_on - study_moment(start).date())
 
 
-def record_interval(db: Session, timer: Timer, start: datetime, end: datetime, shift: timedelta) -> None:
+def record_interval(db: Session, timer: Timer, start: datetime, end: datetime, shift: timedelta) -> set[date]:
+    days: set[date] = set()
     while start < end:
         local_day = study_moment(start).date()
         next_day = datetime.combine(local_day + timedelta(days=1), time.min, SHANGHAI)
         boundary = next_day.astimezone(UTC).replace(tzinfo=None)
         stop = min(boundary, end)
-        db.add(TimerSpan(timer_id=timer.id, day=local_day + shift, began_at=start, ended_at=stop,
+        day = local_day + shift
+        db.add(TimerSpan(timer_id=timer.id, day=day, began_at=start, ended_at=stop,
                          seconds=int((stop - start).total_seconds())))
+        days.add(day)
         start = stop
+    return days
 
 
 @dataclass(frozen=True)
@@ -90,20 +94,45 @@ def confirmed_times(db: Session, start: date | None = None, through: date | None
     return result
 
 
-def correct_time(db: Session, identity: str, source_on: date | None, report_on: date | None, seconds: int,
-                 category: str, base_revision: int, now: datetime) -> TimeEntry:
+def confirmed_timer(db: Session, identity: str) -> Timer:
     timer = db.get(Timer, identity)
     if timer is None or timer.status != "finished":
         raise HTTPException(404, "找不到已确认的计时记录。")
-    if source_on is not None and report_on != source_on:
-        raise HTTPException(422, "有计时区间的记录使用原学习日。")
-    if report_on is not None and seconds > 86_400:
-        raise HTTPException(422, "一天内的有效时长最多为 24 小时。")
+    return timer
+
+
+def recorded_duration(db: Session, timer: Timer, source_on: date | None) -> int:
     spans = select(func.coalesce(func.sum(TimerSpan.seconds), 0)).where(TimerSpan.timer_id == timer.id)
     recorded = (db.scalar(spans.where(TimerSpan.day == source_on)) if source_on is not None
                 else timer.elapsed - db.scalar(spans))
     if recorded <= 0:
         raise HTTPException(404, "找不到该日期的原始计时。")
+    return recorded
+
+
+def correction_history(db: Session, identity: str, source_on: date | None) -> list[dict]:
+    timer = confirmed_timer(db, identity)
+    recorded = recorded_duration(db, timer, source_on)
+    versions = [
+        {"revision": item.revision, "reportOn": item.report_on, "seconds": item.seconds,
+         "category": item.category, "savedAt": item.saved_at.replace(tzinfo=UTC)}
+        for item in db.scalars(select(TimerCorrection).where(
+            TimerCorrection.timer_id == identity, TimerCorrection.source_key == source_key(source_on),
+        ).order_by(TimerCorrection.revision.desc()))
+    ]
+    versions.append({"revision": 0, "reportOn": source_on, "seconds": recorded,
+                     "category": timer.category, "savedAt": None})
+    return versions
+
+
+def correct_time(db: Session, identity: str, source_on: date | None, report_on: date | None, seconds: int,
+                 category: str, base_revision: int, now: datetime) -> TimeEntry:
+    timer = confirmed_timer(db, identity)
+    if source_on is not None and report_on != source_on:
+        raise HTTPException(422, "有计时区间的记录使用原学习日。")
+    if report_on is not None and seconds > 86_400:
+        raise HTTPException(422, "一天内的有效时长最多为 24 小时。")
+    recorded = recorded_duration(db, timer, source_on)
     key = source_key(source_on)
     latest = db.scalar(select(TimerCorrection).where(TimerCorrection.timer_id == identity, TimerCorrection.source_key == key)
                        .order_by(TimerCorrection.revision.desc()).limit(1))

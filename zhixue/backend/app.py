@@ -16,6 +16,13 @@ from .content import is_model_lesson, is_practice, lesson_course
 from .lesson_assistant_api import lesson_assistant_router
 from .backup_api import backup_router, recover_backups
 from .chat_api import conversation_router
+from .capability_catalog import capability_catalog_router
+from .external_memory import ExternalMemoryCredentials, external_memory_router
+from .local_memory import memory_router
+from .mem0 import Transport as ExternalMemoryTransport, request_mem0
+from .mcp_protocol import Transport as RepositoryMcpTransport, request_mcp
+from .repository_mcp import RepositoryMcpCredentials, repository_mcp_router
+from .memory_inference import memory_inference_router
 from .chat_model_api import chat_model_router
 from .course_disputes import course_disputes_router, pending_disputes_count
 from .course_reading import ReadingPositionInput, course_document, position_view
@@ -71,6 +78,10 @@ from .stage_assessments import ensure_assessments
 from .study_consolidation import schedule_consolidation
 from .study_consolidation_api import study_consolidation_router
 from .study_report import study_report_router
+from .weak_practice import local_practice_router
+from .agent_authoring import agent_authoring_router
+from .professional_agent import professional_agent_router
+from .skill_library import skill_library_router
 from .teaching_style import teaching_style_router
 from .timer import TimerInput, change_timer, timer_view
 from .recognition import Recognition, recognition_router
@@ -158,6 +169,10 @@ def create_app(
     backup_credentials: CredentialStore | None = None, pairing_credentials: CredentialStore | None = None,
     workspace_cost_limit: MoneyLimit | None = None,
     desktop_offline: Path | None = None,
+    external_memory_credentials: CredentialStore | None = None,
+    external_memory_transport: ExternalMemoryTransport = request_mem0,
+    repository_mcp_credentials: CredentialStore | None = None,
+    repository_mcp_transport: RepositoryMcpTransport = request_mcp,
 ) -> FastAPI:
     folder = folder.resolve()
     engine = open_db(folder, workspace_cost_limit=workspace_cost_limit)
@@ -187,6 +202,16 @@ def create_app(
 
     app = local_app(session_token, lifespan=lifespan)
     app.include_router(setup_router())
+    app.include_router(skill_library_router(engine, session_token))
+    mcp_vault = repository_mcp_credentials if repository_mcp_credentials is not None else RepositoryMcpCredentials()
+    app.include_router(capability_catalog_router(engine, folder, mcp_vault))
+    app.include_router(repository_mcp_router(engine, mcp_vault, repository_mcp_transport, session_token, get_now))
+    app.include_router(memory_router(engine, get_today, get_now))
+    memory_vault = external_memory_credentials if external_memory_credentials is not None else ExternalMemoryCredentials()
+    app.include_router(external_memory_router(engine, get_now, session_token, memory_vault, external_memory_transport))
+    app.include_router(memory_inference_router(engine, get_now, session_token))
+    app.include_router(professional_agent_router(engine, folder, session_token, get_now, mcp_vault))
+    app.include_router(agent_authoring_router(engine, get_now, session_token))
     if desktop_offline is not None:
         app.include_router(desktop_offline_router(desktop_offline))
 
@@ -232,12 +257,12 @@ def create_app(
     app.include_router(reminders)
     app.include_router(daily_plan_router(engine, folder, demo_day, session_token))
     app.include_router(study_report_router(engine, folder, demo_day, get_now))
+    app.include_router(local_practice_router(engine, demo_day, session_token))
     app.include_router(project_board_router(engine, demo_day, project_moment))
     app.include_router(model_settings_router(engine, vault, model_transport or post_json, get_now,
                                              recognition.recipient_changes))
     app.include_router(backup_router(engine, folder, session_token, demo_day, backup_credentials))
     app.include_router(conversation_router(engine, get_now, project_moment, session_token))
-    app.include_router(chat_model_router(engine, get_now, session_token))
     app.include_router(teaching_style_router(engine))
     app.include_router(lesson_assistant_router(engine, folder, session_token, get_now))
     app.include_router(version_router(engine, session_token, project_moment, get_now))
@@ -448,10 +473,11 @@ def create_app(
                                        payload.action, demo_day(db), project_moment)
 
     library_index = LibraryIndex(engine, folder)
+    app.include_router(chat_model_router(engine, get_now, session_token, library_index))
     app.include_router(goal_authoring_router(engine, folder, library_index, get_now, session_token))
     app.include_router(classification_router(engine, folder, library_index, get_now, session_token))
     app.include_router(recognition_router(recognition, session_token))
-    app.include_router(library_router(engine, folder, demo_day, library_index, recognition))
+    app.include_router(library_router(engine, folder, demo_day, library_index, recognition, get_now))
     app.include_router(graph_router(engine, folder, library_index, demo_day, get_now, session_token))
     app.include_router(graph_recommendation_router(engine, folder, library_index, demo_day, get_now, session_token))
     app.include_router(voice_router(recognition))

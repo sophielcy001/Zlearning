@@ -3,7 +3,7 @@ import { Bell, X } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { api, courseUrl, dateLabel } from './api';
 import { mobileRequest } from './mobile-data';
-import type { LessonReminder, Reminder, ReminderCheck, ReminderDecision, ReminderSettings, ReminderTrigger } from './reminder-data';
+import type { LessonReminder, Reminder, ReminderCheck, ReminderDecision, ReminderReceipt, ReminderSettings, ReminderTrigger } from './reminder-data';
 import { BackedStatus, ErrorNote, useAction, useRead } from './shared';
 
 const REMINDERS = '/reminders';
@@ -16,6 +16,21 @@ export function refreshReminders() {
 }
 
 type PhoneNavigation = { reviews: () => void; lesson: (card: LessonReminder) => void };
+
+function receipts(card: Reminder): ReminderReceipt[] {
+  const primary = { id: card.id, version: card.version };
+  return card.kind === 'daily' && card.disputeReceipt ? [primary, card.disputeReceipt] : [primary];
+}
+
+function outstanding(cards: Reminder[], decided: ReadonlyMap<string, number>): Reminder[] {
+  const active = (receipt: ReminderReceipt) => (decided.get(receipt.id) ?? 0) < receipt.version;
+  return cards.flatMap((card): Reminder[] => {
+    if (card.kind !== 'daily' || !card.disputeReceipt) return active(card) ? [card] : [];
+    const { disputeReceipt, ...daily } = card;
+    if (active(card)) return [active(disputeReceipt) ? card : { ...daily, disputes: 0 }];
+    return active(disputeReceipt) ? [{ ...daily, ...disputeReceipt, reviews: 0 }] : [];
+  });
+}
 
 function ReminderFeed({ workspace, room, connected, peerChecks, navigation, notice }: {
   workspace?: string; room?: string; connected: boolean; peerChecks: boolean; navigation?: PhoneNavigation; notice?: string;
@@ -40,7 +55,9 @@ function ReminderFeed({ workspace, room, connected, peerChecks, navigation, noti
     let previousWallDay = '';
     let pendingForeground = '';
     let delivery: string | undefined;
-    const key = 'zhixue-reminder-delivery/' + (mobile ? workspace ?? 'phone' : 'desktop');
+    const scope = mobile ? workspace ?? 'phone' : 'desktop';
+    // Only the pairing that made a check may recover its missing response.
+    const key = 'zhixue-reminder-delivery/' + scope + (mobile && room ? '/' + room : '');
     const foreground = () => document.visibilityState === 'visible' && (mobile || document.hasFocus());
 
     current.current = [];
@@ -80,7 +97,7 @@ function ReminderFeed({ workspace, room, connected, peerChecks, navigation, noti
         try { sessionStorage.setItem(key, delivery); } catch { /* The current page can still retry. */ }
       }
       try {
-        const shown = current.current.map(({ id, version }) => ({ id, version }));
+        const shown = current.current.flatMap(receipts);
         const input = { trigger, day: today, shown, delivery, notice };
         const response: ReminderCheck = workspace
           ? await mobileRequest({ op: 'reminder-check', workspace, ...input }, room)
@@ -90,8 +107,7 @@ function ReminderFeed({ workspace, room, connected, peerChecks, navigation, noti
         const eligibleDay = trigger === 'foreground' || response.day === input.day;
         today = eligibleDay ? response.day : null;
         if (trigger === 'foreground' && pendingForeground === wallDay) pendingForeground = '';
-        const fresh = eligibleDay
-          ? response.reminders.filter(item => (decided.current.get(item.id) ?? 0) < item.version) : [];
+        const fresh = eligibleDay ? outstanding(response.reminders, decided.current) : [];
         current.current = fresh;
         setCards(fresh);
         try { if (sessionStorage.getItem(key) === delivery) sessionStorage.removeItem(key); } catch { /* Optional reload recovery. */ }
@@ -162,13 +178,15 @@ function ReminderFeed({ workspace, room, connected, peerChecks, navigation, noti
   }, [peerChecks, available]);
 
   async function decide(card: Reminder, value: ReminderDecision) {
-    const data = { version: card.version, action: value };
+    const data = {
+      version: card.version, action: value, disputeReceipt: card.kind === 'daily' ? card.disputeReceipt : undefined,
+    };
     const saved = await action.run(() => workspace
       ? mobileRequest({ op: 'reminder-action', workspace, id: card.id, ...data }, room)
       : api(REMINDERS + '/' + card.id + '/action', 'POST', data));
     if (saved) {
-      decided.current.set(card.id, card.version);
-      const remaining = current.current.filter(item => item.id !== card.id || item.version !== card.version);
+      for (const receipt of receipts(card)) decided.current.set(receipt.id, receipt.version);
+      const remaining = outstanding(current.current, decided.current);
       current.current = remaining;
       setCards(remaining);
     }

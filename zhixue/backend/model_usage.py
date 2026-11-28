@@ -2,15 +2,16 @@ from collections.abc import Callable
 from datetime import UTC, date, datetime
 
 from sqlalchemy import func, select
+from sqlalchemy.orm import object_session
 
-from .db import ChatModelCall, GenerationSettings, GoalAuthoringJob, GraphRecommendation, LibraryClassification, ModelCharge, ModelUse, NoteCheckBatch, NoteSuggestion, PrerequisiteCall, StageReviewCall
+from .db import AgentAuthoringJob, ChatModelCall, GenerationSettings, GoalAuthoringJob, GraphRecommendation, LibraryClassification, MemoryInferenceJob, ModelCharge, ModelUse, NoteCheckBatch, NoteSuggestion, PrerequisiteCall, StageReviewCall
 from .model_ledger import DIRECT_CALL_SOURCES, prepare_call_charge, prepare_charge, utc_clock
 from .model_study_input import DEFAULT_CONCURRENCY
 from .money_budget import DAILY_BUDGET_REASONS, authorize_charge
 from .project_activity import SHANGHAI
 
 
-CALL_TABLES = (ModelUse, ChatModelCall, PrerequisiteCall, StageReviewCall, NoteSuggestion, NoteCheckBatch, GraphRecommendation, LibraryClassification, GoalAuthoringJob)
+CALL_TABLES = (ModelUse, ChatModelCall, PrerequisiteCall, StageReviewCall, NoteSuggestion, NoteCheckBatch, GraphRecommendation, LibraryClassification, GoalAuthoringJob, AgentAuthoringJob, MemoryInferenceJob)
 
 
 def count_calls(db, predicate) -> int:
@@ -30,7 +31,7 @@ def billed_calls(db, day: date) -> int:
 
 
 def charge_count(db, *scope) -> int:
-    return db.scalar(select(func.count()).select_from(ModelCharge).where(*scope))
+    return db.scalar(select(func.count()).select_from(ModelCharge).where(ModelCharge.status != "not_sent", *scope))
 
 
 def billing_day(now: datetime) -> date:
@@ -73,6 +74,10 @@ def admit_reserved_call(db, call, now: Callable[[], datetime], prompt: str, max_
 def settle_interrupted_use(call: ModelUse | PrerequisiteCall, clock: datetime) -> bool:
     """Close a call after worker restart and indicate whether it was still unsent."""
     unsent = call.status == "reserved"
+    db = object_session(call)
+    if not unsent and db is not None:
+        charge = db.get(ModelCharge, (call.__tablename__, call.id))
+        unsent = charge is not None and charge.status == "not_sent"
     call.status = "not_sent" if unsent else "uncertain"
     call.finished_at = max(clock, call.started_at)
     return unsent

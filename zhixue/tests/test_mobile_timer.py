@@ -2,8 +2,10 @@ from datetime import UTC, datetime, timedelta
 import json
 from uuid import uuid4
 
+import pytest
+
 from test_demo import first_lesson
-from test_study_report import local_app, report, timer_action
+from test_study_report import accepted, local_app, report, timer_action
 
 
 PATH = "/api/mobile/timer"
@@ -117,8 +119,10 @@ def test_offline_pause_and_resume_replay_excludes_the_gap_across_shanghai_midnig
         assert second["state"] == "saved" and second["seconds"] == 25
         assert phone.send(finish) == second
         assert phone.state()["active"] is None and phone.state()["pendingReview"] == 0
-        assert report(http, day="2027-02-01")["totals"]["actualSeconds"] == 40
-        assert report(http, day="2027-02-02")["totals"]["actualSeconds"] == 35
+        earlier = report(http, day="2027-02-01")["totals"]
+        later = report(http, day="2027-02-02")["totals"]
+        assert (earlier["plannedSeconds"], earlier["actualSeconds"]) == (None, 40)
+        assert (later["plannedSeconds"], later["actualSeconds"]) == (None, 35)
         assert report(http, period="month")["totals"]["actualSeconds"] == 75
 
 
@@ -203,6 +207,56 @@ def test_lost_clock_keeps_raw_times_and_user_can_confirm_without_double_count(tm
         assert http.post(endpoint, json=input).json() == response.json()
         assert report(http, day="2027-02-01")["totals"]["actualSeconds"] == 50
         assert report(http, day="2027-02-02")["totals"]["actualSeconds"] == 40
+
+
+@pytest.mark.parametrize("reliable", [True, False], ids=["automatic", "manual-clock-confirmation"])
+def test_offline_phone_spans_preserve_saved_plan_baselines_for_their_learning_days(tmp_path, reliable):
+    now = began = datetime(2027, 2, 1, 15, 59, 30)
+    prior_day, resume_day = "2027-02-01", "2027-02-02"
+
+    def plan_hours(http, day, end):
+        accepted(http.put(f"/api/study-plan/days/{day}", json={"windows": [{"start": "09:00", "end": end}]}))
+        return accepted(http.get("/api/study-plan"))["days"][0]["budgetMinutes"]
+
+    with local_app(tmp_path, lambda: now) as http:
+        phone = Phone(http, tmp_path)
+        assert plan_hours(http, prior_day, "09:15") == 15
+        now += timedelta(minutes=2)
+        assert plan_hours(http, resume_day, "09:20") == 20
+
+        phone.send(phone.event("start", began))
+        finish = phone.event("finish", now, start=began, reliable=reliable)
+        reply = phone.send(finish)
+        assert phone.send(finish) == reply
+        if reliable:
+            assert (reply["state"], reply["seconds"]) == ("saved", 120)
+            baseline = 1200
+        else:
+            assert (reply["state"], reply["reason"]) == ("held", "clock")
+            assert report(http)["totals"]["actualSeconds"] == 0
+            assert plan_hours(http, resume_day, "09:25") == 25
+            decision = {"action": "confirm", "beganAt": stamp(began), "endedAt": stamp(now)}
+            path = PATH + f"/conflicts/{finish['id']}"
+            result = accepted(http.post(path, json=decision))
+            assert result["seconds"] == 120
+            assert accepted(http.post(path, json=decision)) == result
+            baseline = 1500
+
+        assert plan_hours(http, resume_day, "09:45") == 45
+        assert report(http)["totals"]["planBudgetSeconds"] == baseline
+
+    with local_app(tmp_path, lambda: now) as reopened:
+        phone.http = reopened
+        replayed = phone.send(finish)
+        if reliable:
+            assert replayed == reply
+        else:
+            assert replayed == result
+        first = report(reopened, day=prior_day)["totals"]
+        second = report(reopened, day=resume_day)["totals"]
+        assert (first["planBudgetSeconds"], first["actualSeconds"]) == (900, 30)
+        assert (second["planBudgetSeconds"], second["actualSeconds"]) == (baseline, 90)
+        assert second["planDifferenceSeconds"] == 90 - second["plannedSeconds"]
 
 
 def test_a_delayed_mobile_start_cannot_replace_the_current_desktop_timer(tmp_path):

@@ -1,4 +1,5 @@
 const SAMPLE_RATE = 16_000;
+const MICROPHONE_DISCONNECTED = '麦克风已断开，请重新录音。';
 
 async function wavFile(chunks: Float32Array[], rate: number, maxSeconds: number): Promise<Blob> {
   const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
@@ -54,12 +55,14 @@ export async function recordVoice(maxSeconds: number, signal: AbortSignal, start
     await context.audioWorklet.addModule('/voice-capture.js');
     signal.throwIfAborted();
 
+    const tracks = stream.getAudioTracks();
+    if (!tracks.some(track => track.readyState === 'live')) throw new Error(MICROPHONE_DISCONNECTED);
+
     const input = context.createMediaStreamSource(stream);
     const node = new AudioWorkletNode(context, 'zhixue-voice-capture', {
       channelCount: 1, channelCountMode: 'explicit',
       processorOptions: { maxSamples: maxSeconds * context.sampleRate },
     });
-    const tracks = stream.getAudioTracks();
     const chunks = await new Promise<Float32Array[]>((resolve, reject) => {
       const received: Float32Array[] = [];
       let finishTimer: number | undefined;
@@ -75,7 +78,7 @@ export async function recordVoice(maxSeconds: number, signal: AbortSignal, start
         else resolve(received);
       }
       function cancelled() { complete(signal.reason); }
-      function interrupted() { complete(new Error('麦克风已断开，请重新录音。')); }
+      function interrupted() { complete(new Error(MICROPHONE_DISCONNECTED)); }
       function stop() {
         if (finishTimer !== undefined) return;
         finishTimer = window.setTimeout(() => complete(new Error('录音未能保存为草稿，请重新录音。')), 2500);

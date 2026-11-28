@@ -509,6 +509,8 @@ test('Electron releases a late microphone stream when hidden and can record agai
   const app = await electron.launch(electronOptions(folder, [
     '--use-fake-device-for-media-stream',
     '--use-file-for-fake-audio-capture=' + resolve('e2e/fixtures/voice-jfk.wav'),
+    // The sandboxed macOS audio service cannot read the fixture and captures silence.
+    ...(process.platform === 'darwin' ? ['--disable-features=AudioServiceSandbox'] : []),
   ]));
   const processHandle = app.process();
   try {
@@ -542,6 +544,22 @@ test('Electron releases a late microphone stream when hidden and can record agai
         if (hold) await first;
         return stream;
       };
+
+      const addModule = AudioWorklet.prototype.addModule;
+      let heldModule: Promise<void> | undefined;
+      Reflect.set(window, 'holdTestVoiceModule', () => {
+        Reflect.set(window, 'testVoiceModuleWaiting', false);
+        heldModule = new Promise<void>(resolve => { Reflect.set(window, 'releaseTestVoiceModule', resolve); });
+      });
+      AudioWorklet.prototype.addModule = async function (...args) {
+        const hold = heldModule;
+        heldModule = undefined;
+        if (hold) {
+          Reflect.set(window, 'testVoiceModuleWaiting', true);
+          await hold;
+        }
+        return addModule.apply(this, args);
+      };
     });
     const trackStates = () => page.evaluate(() =>
       (Reflect.get(window, 'testVoiceTracks') as MediaStreamTrack[]).map(track => track.readyState));
@@ -556,58 +574,99 @@ test('Electron releases a late microphone stream when hidden and can record agai
     const button = page.getByRole('button', { name: '学习问题语音输入' });
     const dialog = page.getByRole('dialog', { name: '录音转文字' });
     const start = dialog.getByRole('button', { name: '开始录音' });
-    await input.fill('保留原来输入的目标');
-    await button.click();
-    await start.click();
-    await expect(dialog.getByText('正在打开麦克风')).toBeVisible();
-    await expect.poll(trackStates).toEqual(['live']);
-    await hide();
-    await expect.poll(() => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isVisible())).toBe(false);
-    await page.evaluate(() => Reflect.get(window, 'releaseTestVoice')());
-    await expect.poll(trackStates).toEqual(['ended']);
-    await expect(dialog).toHaveCount(0);
-    expect(transcriptions).toBe(0);
-    console.log('PASS hiding the Electron window ends the late-arriving simulated microphone stream without transcribing');
+    const originalInput = '保留原来输入的目标';
+    const confirmEnded = (count: number) => expect.poll(trackStates).toEqual(Array(count).fill('ended'));
+    const disconnect = () => page.evaluate(() => {
+      const track = (Reflect.get(window, 'testVoiceTracks') as MediaStreamTrack[]).at(-1)!;
+      const previous = track.readyState;
+      track.stop();
+      track.dispatchEvent(new Event('ended'));
+      return [previous, track.readyState];
+    });
+    await input.fill(originalInput);
 
-    await show();
-    await button.click();
-    await start.click();
-    await expect(dialog.getByText('正在录音', { exact: true })).toBeVisible();
-    await app.evaluate(({ BrowserWindow }) => { BrowserWindow.getAllWindows()[0].minimize(); });
-    await expect.poll(() => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isMinimized())).toBe(true);
-    await expect(dialog).toHaveCount(0);
-    await expect.poll(trackStates).toEqual(['ended', 'ended']);
-    expect(transcriptions).toBe(0);
-    console.log('PASS minimizing Electron while recording releases the simulated microphone');
+    await test.step('ends the late microphone stream when the window is hidden', async () => {
+      await button.click();
+      await start.click();
+      await expect(dialog.getByText('正在打开麦克风')).toBeVisible();
+      await expect.poll(trackStates).toEqual(['live']);
+      await hide();
+      await expect.poll(() => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isVisible())).toBe(false);
+      await page.evaluate(() => Reflect.get(window, 'releaseTestVoice')());
+      await confirmEnded(1);
+      await expect(dialog).toHaveCount(0);
+      expect(transcriptions).toBe(0);
+    });
 
-    await show();
-    await button.click();
-    await dialog.getByLabel('录音语言').selectOption('en');
-    await start.click();
-    await expect(dialog.getByText('正在录音', { exact: true })).toBeVisible();
-    await new Promise(resolve => setTimeout(resolve, 4100));
-    await dialog.getByRole('button', { name: '停止并识别' }).click();
-    const draft = dialog.getByRole('textbox', { name: '语音草稿' });
-    await expect(draft).toHaveValue(/fellow Americans/i, { timeout: 15000 });
-    await expect(input).toHaveValue('保留原来输入的目标');
-    expect(transcriptions).toBe(1);
-    await expect.poll(trackStates).toEqual(['ended', 'ended', 'ended']);
-    await draft.fill('核对后的本机转写');
-    await dialog.getByRole('button', { name: '填入文字' }).click();
-    await expect(input).toHaveValue('保留原来输入的目标\n核对后的本机转写');
-    console.log('PASS Electron accepts audio without camera access and applies the local transcript only on confirmation');
+    await test.step('handles a disconnected microphone during setup and capture', async () => {
+      await show();
+      await button.click();
+      await page.evaluate(() => Reflect.get(window, 'holdTestVoiceModule')());
+      try {
+        await start.click();
+        await expect(dialog.getByText('正在打开麦克风')).toBeVisible();
+        await expect.poll(() => page.evaluate(() => Reflect.get(window, 'testVoiceModuleWaiting'))).toBe(true);
+        expect(await disconnect()).toEqual(['live', 'ended']);
+      } finally {
+        await page.evaluate(() => Reflect.get(window, 'releaseTestVoiceModule')());
+      }
+      const disconnected = dialog.getByText('麦克风已断开，请重新录音。', { exact: true });
+      await expect(disconnected).toBeVisible();
+      await expect(start).toBeEnabled();
+      await confirmEnded(2);
 
-    await button.click();
-    await start.click();
-    await expect(dialog.getByText('正在录音', { exact: true })).toBeVisible();
-    await page.evaluate(() => { location.hash = '/library'; });
-    await expect(page.getByRole('heading', { name: '知识库', exact: true })).toBeVisible();
-    await expect(dialog).toHaveCount(0);
-    await expect.poll(trackStates).toEqual(['ended', 'ended', 'ended', 'ended']);
-    expect(transcriptions).toBe(1);
-    console.log('PASS navigating away releases the simulated microphone while leaving the local service usable');
-    await app.close();
-    await expect.poll(() => fetch(health).then(() => false, () => true)).toBe(true);
+      await start.click();
+      await expect(dialog.getByText('正在录音', { exact: true })).toBeVisible();
+      expect(await disconnect()).toEqual(['live', 'ended']);
+      await expect(disconnected).toBeVisible();
+      await expect(start).toBeEnabled();
+      await confirmEnded(3);
+      expect(transcriptions).toBe(0);
+      await expect(input).toHaveValue(originalInput);
+      await dialog.getByRole('button', { name: '取消' }).click();
+    });
+
+    await test.step('releases the microphone when the window is minimized', async () => {
+      await button.click();
+      await start.click();
+      await expect(dialog.getByText('正在录音', { exact: true })).toBeVisible();
+      await app.evaluate(({ BrowserWindow }) => { BrowserWindow.getAllWindows()[0].minimize(); });
+      await expect.poll(() => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isMinimized())).toBe(true);
+      await expect(dialog).toHaveCount(0);
+      await confirmEnded(4);
+      expect(transcriptions).toBe(0);
+    });
+
+    await test.step('transcribes a new recording locally and applies only confirmed text', async () => {
+      await show();
+      await button.click();
+      await dialog.getByLabel('录音语言').selectOption('en');
+      await start.click();
+      await expect(dialog.getByText('正在录音', { exact: true })).toBeVisible();
+      await new Promise(resolve => setTimeout(resolve, 4100));
+      await dialog.getByRole('button', { name: '停止并识别' }).click();
+      const draft = dialog.getByRole('textbox', { name: '语音草稿' });
+      await expect(draft).toHaveValue(/fellow Americans/i, { timeout: 15000 });
+      await expect(input).toHaveValue(originalInput);
+      expect(transcriptions).toBe(1);
+      await confirmEnded(5);
+      await draft.fill('核对后的本机转写');
+      await dialog.getByRole('button', { name: '填入文字' }).click();
+      await expect(input).toHaveValue(originalInput + '\n核对后的本机转写');
+    });
+
+    await test.step('releases recording when leaving and stops the local service', async () => {
+      await button.click();
+      await start.click();
+      await expect(dialog.getByText('正在录音', { exact: true })).toBeVisible();
+      await page.evaluate(() => { location.hash = '/library'; });
+      await expect(page.getByRole('heading', { name: '知识库', exact: true })).toBeVisible();
+      await expect(dialog).toHaveCount(0);
+      await confirmEnded(6);
+      expect(transcriptions).toBe(1);
+      await app.close();
+      await expect.poll(() => fetch(health).then(() => false, () => true)).toBe(true);
+    });
   } finally {
     if (processHandle.exitCode === null && processHandle.signalCode === null) await app.close();
     rmSync(folder, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });

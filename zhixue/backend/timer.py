@@ -93,7 +93,7 @@ def timer_lesson(db: Session, lesson_id: UUID | None, category: Activity, review
 
 
 def change_timer(db: Session, payload: TimerInput, now: datetime, study_time: datetime,
-                 before_start: Callable[[], None]) -> dict:
+                 before_running: Callable[[], None]) -> dict:
     current = active_timer(db)
     if payload.action == "start":
         review_key = payload.reviewKey
@@ -101,7 +101,7 @@ def change_timer(db: Session, payload: TimerInput, now: datetime, study_time: da
         if (current and current.device == "desktop" and current.lesson_id == lesson.id and current.review_key == review_key
                 and (current.category == payload.category or (current.category == "unclassified" and payload.category == "learning"))):
             return timer_view(db, now)
-        before_start()
+        before_running()
         if current:
             finish_timer(db, current, now, study_time)
         db.add(Timer(id=str(uuid4()), lesson_id=lesson.id, status="running", elapsed=0, started_at=now, updated_at=now,
@@ -124,6 +124,8 @@ def change_timer(db: Session, payload: TimerInput, now: datetime, study_time: da
             if target == "finished":
                 finish_timer(db, timer, now, study_time)
             else:
+                if target == "running":
+                    before_running()
                 set_status(db, timer, target, now, study_time)
     db.flush()
     return timer_view(db, now)

@@ -28,6 +28,98 @@ class Base(DeclarativeBase):
     pass
 
 
+class InstalledSkill(Base):
+    __tablename__ = "installed_skills"
+
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    checksum: Mapped[str] = mapped_column(String(64))
+    source: Mapped[str] = mapped_column(Text)
+    manifest: Mapped[dict] = mapped_column(JSON)
+    activation: Mapped[int]
+
+
+class SkillVersion(Base):
+    __tablename__ = "skill_versions"
+    __table_args__ = (UniqueConstraint("name", "position"),)
+
+    name: Mapped[str] = mapped_column(ForeignKey("installed_skills.name", ondelete="CASCADE"), primary_key=True)
+    checksum: Mapped[str] = mapped_column(String(64), primary_key=True)
+    position: Mapped[int]
+    source: Mapped[str] = mapped_column(Text)
+    manifest: Mapped[dict] = mapped_column(JSON)
+
+
+class ProfessionalAgent(Base):
+    __tablename__ = "professional_agents"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str]
+    revision: Mapped[int]
+    definition: Mapped[dict] = mapped_column(JSON)
+    confirmation: Mapped[str] = mapped_column(String(64))
+
+
+class LocalMemory(Base):
+    __tablename__ = "local_memories"
+    __table_args__ = (
+        Index("ix_local_memories_review", "state", "review_on"),
+        CheckConstraint("state IN ('active', 'pending', 'deleted')", name="memory_state"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    text: Mapped[str | None] = mapped_column(Text)
+    state: Mapped[str]
+    revision: Mapped[int]
+    agent_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("professional_agents.id"))
+    source_message_id: Mapped[str | None] = mapped_column(String(36), unique=True)
+    conversation_id: Mapped[str | None] = mapped_column(String(36))
+    origin: Mapped[str] = mapped_column(server_default="explicit")
+    review_on: Mapped[date | None]
+    updated_at: Mapped[datetime]
+
+
+class RepositoryMcpConnection(Base):
+    __tablename__ = "repository_mcp_connections"
+
+    provider: Mapped[str] = mapped_column(primary_key=True)
+    revision: Mapped[int]
+    enabled: Mapped[bool] = mapped_column(Boolean)
+    repositories: Mapped[list[str]] = mapped_column(JSON)
+    tools: Mapped[list[str]] = mapped_column(JSON)
+    version: Mapped[str | None]
+    credential_ref: Mapped[str | None] = mapped_column(String(36))
+    credential_hash: Mapped[str | None] = mapped_column(String(64))
+
+
+class ExternalMemoryConnection(Base):
+    __tablename__ = "external_memory_connection"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    revision: Mapped[int]
+    reference: Mapped[str] = mapped_column(String(36))
+    key_hash: Mapped[str] = mapped_column(String(64))
+    scopes: Mapped[list[str]] = mapped_column(JSON)
+
+
+class ExternalMemoryCopy(Base):
+    __tablename__ = "external_memory_copies"
+    __table_args__ = (Index("ix_external_memory_queue", "attempt", "state", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    memory_id: Mapped[str] = mapped_column(String(36), index=True)
+    memory_revision: Mapped[int]
+    memory_scope: Mapped[str]
+    content_hash: Mapped[str] = mapped_column(String(64))
+    confirmation: Mapped[str] = mapped_column(String(64))
+    state: Mapped[str]
+    remote_ids: Mapped[list[str]] = mapped_column(JSON)
+    delete_requested: Mapped[bool] = mapped_column(Boolean)
+    attempt: Mapped[bool] = mapped_column(Boolean)
+    error: Mapped[str | None]
+    created_at: Mapped[datetime]
+    updated_at: Mapped[datetime]
+
+
 class Project(Base):
     __tablename__ = "projects"
 
@@ -425,6 +517,20 @@ class Attempt(Base):
     result: Mapped[dict] = mapped_column(JSON)
 
 
+class LocalPracticeAttempt(Base):
+    __tablename__ = "local_practice_attempts"
+    __table_args__ = (ForeignKeyConstraint(
+        ["lesson_id", "key", "source_round"], ["attempts.lesson_id", "attempts.key", "attempts.round_number"],
+        ondelete="CASCADE",
+    ),)
+
+    lesson_id: Mapped[str] = mapped_column(primary_key=True)
+    key: Mapped[str] = mapped_column(primary_key=True)
+    source_round: Mapped[int] = mapped_column(primary_key=True)
+    input: Mapped[dict] = mapped_column(JSON)
+    view: Mapped[dict] = mapped_column(JSON)
+
+
 class MobileWorkspace(Base):
     __tablename__ = "mobile_workspace"
 
@@ -473,6 +579,17 @@ class LibraryOcrPage(Base):
     body: Mapped[str] = mapped_column(Text)
 
 
+class LibraryOcrVersion(Base):
+    __tablename__ = "library_ocr_versions"
+
+    file_id: Mapped[str] = mapped_column(ForeignKey("imports.id", ondelete="CASCADE"), primary_key=True)
+    page: Mapped[int] = mapped_column(primary_key=True)
+    text_revision: Mapped[str] = mapped_column(primary_key=True)
+    source_revision: Mapped[str]
+    body: Mapped[str] = mapped_column(Text)
+    saved_at: Mapped[datetime | None]
+
+
 class Conversation(Base):
     __tablename__ = "conversations"
 
@@ -515,6 +632,7 @@ class ChatReply(Base):
     recipient: Mapped[dict] = mapped_column(JSON)
     history: Mapped[list[dict]] = mapped_column(JSON)
     style: Mapped[str] = mapped_column(String(16), server_default="direct")
+    agent_scope: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))
     state: Mapped[str]
     error: Mapped[str | None]
     created_at: Mapped[datetime] = mapped_column(DateTime)
@@ -1123,6 +1241,22 @@ class GoalAuthoringJob(ScopedRecommendationColumns, Base):
     conversation_id: Mapped[str] = mapped_column(ForeignKey("conversations.id", ondelete="CASCADE"))
     goal_id: Mapped[str] = mapped_column(String(36))
     result: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))
+
+
+class AgentAuthoringJob(ScopedRecommendationColumns, Base):
+    __tablename__ = "agent_authoring_jobs"
+    __table_args__ = (Index("ix_agent_authoring_queue", "state", "created_at"),)
+
+    result: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))
+
+
+class MemoryInferenceJob(ScopedRecommendationColumns, Base):
+    __tablename__ = "memory_inference_jobs"
+    __table_args__ = (Index("ix_memory_inference_queue", "state", "created_at"),)
+
+    source_message_id: Mapped[str] = mapped_column(String(36), index=True)
+    memory_id: Mapped[str | None] = mapped_column(String(36))
+    automatic: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("0"))
 
 
 class GraphRecommendation(ScopedRecommendationColumns, Base):

@@ -7,8 +7,9 @@ import StarterKit from '@tiptap/starter-kit';
 import { Bold, Code2, Heading2, Italic, Link2, List, ListOrdered, Quote, Sigma, Sparkles } from 'lucide-react';
 import { Marked, type marked } from 'marked';
 import { useLayoutEffect, useMemo, useRef, useState, type FormEvent, type Ref } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import type { WikiTarget } from './api';
+import { libraryLinkUrl } from './library-views';
 import { isCourseSourceRoute, workspaceMarkdownRoute } from './markdown-links';
 import type { NoteAISelection } from './note-ai';
 import { richAISelection, sourceAISelection } from './note-ai-selection';
@@ -73,6 +74,7 @@ export default function NoteEditor({ content, disabled, onChange, label, onAI, f
   location?: { id: string };
 }) {
   const navigate = useNavigate();
+  const routeLocation = useLocation();
   const [mode, setMode] = useState<Mode>('rich');
   const [sourceOnly, setSourceOnly] = useState(false);
   const [limitError, setLimitError] = useState('');
@@ -149,7 +151,7 @@ export default function NoteEditor({ content, disabled, onChange, label, onAI, f
           const route = workspaceMarkdownRoute(href);
           const open = event.metaKey || event.ctrlKey || event.detail === 0;
           if (route && (open || link.hasAttribute('data-wiki-reference') || isCourseSourceRoute(route))) {
-            navigate(route);
+            navigate(libraryLinkUrl(route, routeLocation));
           } else if (open && linkAllowed(href)) {
             window.open(href, '_blank', 'noopener,noreferrer');
           }

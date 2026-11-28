@@ -27,7 +27,7 @@ DATABASE = "zhixue.sqlite3"
 MANIFEST_LIMIT = 16 * 1024 * 1024
 COUNTED_TABLES = (
     "projects", "lessons", "reviews", "attempts", "timers", "imports", "note_versions",
-    "note_conflicts", "notes", "note_lessons", "note_suggestions", "project_views", "model_connections", "model_roles", "tasks",
+    "note_conflicts", "notes", "note_lessons", "note_suggestions", "project_views", "model_connections", "model_roles", "tasks", "installed_skills", "skill_versions", "professional_agents", "agent_authoring_jobs", "local_memories", "memory_inference_jobs", "local_practice_attempts",
     "note_check_plans", "note_check_batches",
     "conversations", "chat_messages", "chat_attachments", "chat_replies", "chat_model_calls", "teaching_preferences", "goal_authoring_jobs", "goal_versions", "route_versions",
     "model_studies", "generation_steps", "generation_settings", "model_uses", "model_charges", "model_task_budgets",
@@ -40,7 +40,7 @@ COUNTED_TABLES = (
     "prerequisite_tasks", "prerequisite_calls",
     "study_plan_settings", "study_day_overrides", "study_plan_locks",
     "timer_spans", "timer_corrections", "study_plan_snapshots",
-    "reminder_settings", "reminder_receipts", "library_ocr_pages", "library_web_snapshots",
+    "reminder_settings", "reminder_receipts", "library_ocr_pages", "library_ocr_versions", "library_web_snapshots",
     "library_graph", "library_graph_revisions", "graph_recommendations", "graph_candidates", "library_wiki_aliases",
     "library_file_tags", "library_file_activity",
     "library_file_copies",
@@ -289,6 +289,11 @@ def stage_database(source: sqlite3.Connection, destination: Path, schema: str) -
         # Connection settings are portable. OS credential references and old probe results are machine-specific.
         target.execute("UPDATE model_connections SET credential_ref=NULL, last_test=NULL, test_token=NULL")
         target.execute("DELETE FROM model_credential_pending")
+        if target.execute("SELECT 1 FROM sqlite_schema WHERE name='repository_mcp_connections'").fetchone():
+            target.execute("UPDATE repository_mcp_connections SET credential_ref=NULL, credential_hash=NULL, enabled=0")
+        if target.execute("SELECT 1 FROM sqlite_schema WHERE name='external_memory_connection'").fetchone():
+            target.execute("DELETE FROM external_memory_copies")
+            target.execute("DELETE FROM external_memory_connection")
         target.execute("DELETE FROM reminder_push_claims")
         if target.execute("SELECT 1 FROM sqlite_schema WHERE name='recognition_grants'").fetchone():
             target.execute("DELETE FROM recognition_grants")

@@ -42,6 +42,7 @@ class AuthorizeInput(PreviewInput):
 
 class PrepareInput(Input):
     mode: Literal["formal", "practice"]
+    focus: UUID | None = None
 
 
 AnswerText = Annotated[str, Field(max_length=3000)]
@@ -77,6 +78,18 @@ def target_round(db, identity: UUID):
     lesson = db.get(Lesson, saved.lesson_id)
     project, objective, review = target_objective(db, lesson, saved.key)
     return saved, lesson, project, objective, review
+
+
+def weak_assessment(db, lesson, objective, identity):
+    saved = db.get(AssessmentRound, str(identity))
+    if (not saved or saved.lesson_id != lesson.id or saved.key != objective.key
+            or saved.mode != "formal" or saved.state != "graded"):
+        raise HTTPException(409, "请选择报告中的已评价正式题组。")
+    grade = db.scalar(select(AssessmentGrade).where(AssessmentGrade.round_id == saved.id)
+                      .order_by(AssessmentGrade.version.desc()).limit(1))
+    if grade is None or grade.result["outcome"] not in {"hinted", "failed"}:
+        raise HTTPException(409, "该题组当前没有薄弱评价，请刷新学习报告。")
+    return saved
 
 
 def scope_signature(secret: bytes, lesson: Lesson, plan: AssessmentPlan | None, fields: dict) -> str:
@@ -251,14 +264,25 @@ def assessment_router(engine, folder: Path, session_token: str, now, day) -> API
             return settings_view(db, lesson, None)
 
     @router.get("/lessons/{identity}/assessments/{key}")
-    def objective_view(identity: UUID, key: str):
+    def objective_view(identity: UUID, key: str, focus: UUID | None = None):
         with transaction(engine) as db:
             lesson = lesson_target(db, identity)
             project, objective, review = target_objective(db, lesson, key)
             status = assessment_status(db, folder, project, lesson, review, objective, day(db))
             active = pending_round(db, review) if status == "waiting" else round_for(db, review, "formal") if status == "due" else None
             previous = round_for(db, review, "formal", number=review.round_number - 1) if review.round_number > 1 else None
+            focused = {}
+            if focus is not None:
+                source = weak_assessment(db, lesson, objective, focus)
+                active = round_for(db, review, "practice")
+                note = None
+                if source.course_version != objective.basis["version"]:
+                    note = "原评价使用较早的课程版本，可查看原评价和现有讲解。"
+                elif status not in {"upcoming", "complete", "due"}:
+                    note = "该知识目标暂不能生成专项练习。"
+                focused = {"focus": round_view(db, source), "focusIssue": note}
             return {
+                **focused,
                 **assessment_review_info(project, review, objective, status), "round": review.round_number,
                 "group": round_view(db, active) if active else None, "latest": round_view(db, previous) if previous else None,
             }
@@ -269,6 +293,12 @@ def assessment_router(engine, folder: Path, session_token: str, now, day) -> API
             lesson = lesson_target(db, identity)
             project, objective, review = target_objective(db, lesson, key)
             status = assessment_status(db, folder, project, lesson, review, objective, day(db))
+            if payload.focus is not None:
+                if payload.mode != "practice":
+                    raise HTTPException(422, "薄弱评价只能用于专项练习。")
+                source = weak_assessment(db, lesson, objective, payload.focus)
+                if source.course_version != objective.basis["version"]:
+                    raise HTTPException(409, "原评价的课程依据已更新，请在课程中查看当前复习范围。")
             allow_mode(payload.mode, status, objective)
             saved = round_for(db, review, payload.mode)
             if saved is None:

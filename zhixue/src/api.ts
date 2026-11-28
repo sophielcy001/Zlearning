@@ -23,8 +23,9 @@ export class ApiError extends Error {
   }
 }
 
-export async function apiResponse(path: string, method = 'GET', body?: BodyInit, contentType?: string, signal?: AbortSignal, keepalive?: boolean): Promise<Response> {
-  const headers = new Headers({ Authorization: `Bearer ${sessionStorage.getItem(sessionKey) ?? ''}` });
+export async function apiResponse(path: string, method = 'GET', body?: BodyInit, contentType?: string, signal?: AbortSignal, keepalive?: boolean, extraHeaders?: HeadersInit): Promise<Response> {
+  const headers = new Headers(extraHeaders);
+  headers.set('Authorization', 'Bearer ' + (sessionStorage.getItem(sessionKey) ?? ''));
   if (contentType) headers.set('Content-Type', contentType);
   const response = await fetch(`/api${path}`, {
     method, signal, headers, body, keepalive,
@@ -152,7 +153,7 @@ export type LibraryItem = {
   projectId: string | null; projectTopic: string | null; projectIds?: string[]; revision: string | null;
   status: 'ready' | 'partial' | 'missing' | 'failed' | 'empty' | 'trashed' | 'purged'; message: string | null;
   trashId?: string;
-  tags?: LibraryTag[]; favorite?: boolean; lastViewedAt?: string | null;
+  tags?: LibraryTag[]; favorite?: boolean; lastViewedAt?: string | null; lastViewedOrder?: number;
   pageCount: number | null; unreadablePages: number[];
 };
 export type LibraryLocation = { number: number; label: string; textRevision?: string };
@@ -162,7 +163,7 @@ export type LibraryFile = LibraryItem & {
   webSource?: WebSource | null; sections?: LibraryLocation[];
 };
 export type LibraryHit = LibraryItem & {
-  location: LibraryLocation | null; snippet: string; match?: 'keyword' | 'semantic' | 'both';
+  location: LibraryLocation | null; snippet: string; semanticExcerpt?: string; match?: 'keyword' | 'semantic' | 'both';
 };
 export type SemanticIndexStatus = {
   state: 'disabled' | 'preparing' | 'indexing' | 'ready' | 'failed';

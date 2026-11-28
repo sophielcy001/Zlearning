@@ -17,7 +17,7 @@ from .content import is_model_lesson, lesson_course
 from .daily_plan import forecast, load_plan
 from .db import AssessmentGrade, AssessmentObjective, AssessmentRound, Attempt, Lesson, Project, StudyPlanSnapshot, transaction
 from .project_board import scheduled_lesson
-from .study_time import CATEGORIES, TimeCategory, confirmed_times, correct_time
+from .study_time import CATEGORIES, TimeCategory, confirmed_times, correct_time, correction_history
 
 
 Period = Literal["day", "week", "month"]
@@ -72,26 +72,34 @@ def report_window(period: Period, anchor: date) -> tuple[date, date]:
 
 
 def project_predictions(db: Session, folder: Path, today: date) -> list[dict]:
-    counts = (select(Project.id, Project.topic, Lesson.ready, func.count(Lesson.id))
-              .join(Lesson, Lesson.project_id == Project.id)
-              .where(Project.paused.is_(False), Lesson.learned_on.is_(None), scheduled_lesson())
-              .group_by(Project.id, Project.topic, Lesson.ready)
-              .order_by(Project.topic, Project.id))
+    unfinished = (select(Project.id, Project.topic, Lesson.id, Lesson.ready)
+                  .join(Lesson, Lesson.project_id == Project.id)
+                  .where(Project.paused.is_(False), Lesson.learned_on.is_(None), scheduled_lesson())
+                  .order_by(Project.topic, Project.id))
     projects = {}
-    for identity, topic, ready, count in db.execute(counts):
-        entry = projects.setdefault(identity, {"projectId": identity, "projectTopic": topic, "left": 0, "notReady": 0})
-        entry["left"] += count
+    project_by_lesson = {}
+    for identity, topic, lesson_id, ready in db.execute(unfinished):
+        project_by_lesson[lesson_id] = identity
+        entry = projects.setdefault(identity, {
+            "projectId": identity, "projectTopic": topic, "left": 0, "notReady": 0, "pendingLessonLocks": [],
+        })
+        entry["left"] += 1
         if not ready:
-            entry["notReady"] += count
+            entry["notReady"] += 1
     if not projects:
         return []
     scheduled = defaultdict(list)
-    if any(entry["notReady"] == 0 for entry in projects.values()):
-        projection = forecast(load_plan(db, folder, today, days=PREDICTION_DAYS))
-        for day in projection["days"]:
-            for task in day["tasks"]:
-                if task["kind"] == "lesson":
-                    scheduled[task["projectId"]].append(task)
+    projection = forecast(load_plan(db, folder, today, days=PREDICTION_DAYS))
+    for booking in projection["pendingLocks"]:
+        entry = projects.get(project_by_lesson.get(booking["lessonId"]))
+        if entry is not None and booking["kind"] == "lesson":
+            entry["pendingLessonLocks"].append({
+                key: booking[key] for key in ("id", "title", "status", "date", "start", "end")
+            })
+    for day in projection["days"]:
+        for task in day["tasks"]:
+            if task["kind"] == "lesson":
+                scheduled[task["projectId"]].append(task)
     for identity, entry in projects.items():
         tasks = scheduled[identity]
         entry["expectedOn"] = tasks[-1]["date"] if not entry["notReady"] and len(tasks) == entry["left"] else None
@@ -141,7 +149,8 @@ def learning_report(db: Session, folder: Path, today: date, period: Period, anch
     snapshots = list(db.scalars(select(StudyPlanSnapshot).where(StudyPlanSnapshot.day.between(trend_start, through))))
     plans = {item.day: sum(task["minutes"] for task in item.items) * 60 for item in snapshots}
     attempts = review_events(db, through)
-    by_outcome = Counter(item.outcome for item in attempts if start <= item.submitted)
+    period_attempts = [item for item in attempts if start <= item.submitted]
+    by_outcome = Counter(item.outcome for item in period_attempts)
     targets = {}
     for item in attempts:
         if item.outcome != "ungraded":
@@ -149,20 +158,30 @@ def learning_report(db: Session, folder: Path, today: date, period: Period, anch
     objective_titles = {(lesson, key): title for lesson, key, title in db.execute(
         select(AssessmentObjective.lesson_id, AssessmentObjective.key, AssessmentObjective.title)
     )}
+    def objective_title(item: ReviewEvent) -> str | None:
+        return (objective_titles if item.group else local_objectives).get((item.lesson, item.key))
+
+    review_records = [
+        {"lessonId": item.lesson, "key": item.key, "round": item.number, "on": item.submitted,
+         "outcome": item.outcome, "groupId": item.group, "title": objective_title(item),
+         "lessonTitle": titles[item.lesson]["title"], "projectTopic": titles[item.lesson]["projectTopic"]}
+        for item in reversed(period_attempts)
+    ]
     weak = []
     for item in sorted(targets.values(), key=lambda event: (event.submitted, event.number, event.lesson, event.key), reverse=True):
         if item.outcome in ("hinted", "failed"):
-            title = (objective_titles if item.group else local_objectives).get((item.lesson, item.key))
+            title = objective_title(item)
             if title is not None:
                 weak.append({"lessonId": item.lesson, "key": item.key, "title": title,
                              "projectTopic": titles[item.lesson]["projectTopic"], "on": item.submitted,
-                             "outcome": item.outcome, "groupId": item.group})
+                             "outcome": item.outcome, "groupId": item.group, "sourceRound": item.number})
     plans_in_period = [snapshot for snapshot in snapshots if start <= snapshot.day]
     planned_seconds = sum(plans[item.day] for item in plans_in_period)
     actual_on_planned_days = sum(entry.seconds for entry in measured if entry.report_on in plans)
     categories = Counter()
     for entry in measured:
         categories[entry.category] += entry.seconds
+    actual_seconds = sum(categories.values())
     trend = []
     for offset in range((through - trend_start).days + 1):
         day = trend_start + timedelta(days=offset)
@@ -184,15 +203,19 @@ def learning_report(db: Session, folder: Path, today: date, period: Period, anch
                                key=lambda item: (item["date"], item["title"]), reverse=True)
     return {
         "today": today, "period": period, "from": start, "through": through, "previous": earlier, "next": later,
-        "totals": {"actualSeconds": sum(categories.values()), "learned": len(learned_in_period),
+        "totals": {"actualSeconds": actual_seconds, "learned": len(learned_in_period),
+                   "periodDays": (through - start).days + 1,
+                   "actualWithoutPlanSeconds": actual_seconds - actual_on_planned_days,
                    "byCategory": {name: categories[name] for name in CATEGORIES}, "review": {name: by_outcome[name] for name in OUTCOMES},
                    "plannedSeconds": planned_seconds if plans_in_period else None, "recordedPlanDays": len(plans_in_period),
                    "planBudgetSeconds": sum(item.budget_minutes for item in plans_in_period) * 60 if plans_in_period else None,
                    "actualOnPlannedDaysSeconds": actual_on_planned_days if plans_in_period else None,
                    "planDifferenceSeconds": actual_on_planned_days - planned_seconds if plans_in_period else None},
-        "trend": trend, "learned": learned_in_period,
+        "trend": trend, "learned": learned_in_period, "reviewRecords": review_records,
         "weak": weak, "efficiency": efficiency(start, through),
-        "previousEfficiency": efficiency(previous_start, previous_through) if earlier is not None else None,
+        "previousEfficiency": ({**efficiency(previous_start, previous_through),
+                                "from": previous_start, "through": previous_through}
+                               if earlier is not None else None),
         "predictions": project_predictions(db, folder, today), "predictionDays": PREDICTION_DAYS,
         "timeRecords": records(measured), "unassignedTimers": records(by_day[None]),
     }
@@ -210,6 +233,11 @@ def study_report_router(engine: Engine, folder: Path, current_day: Callable[[Ses
             if anchor > today:
                 raise HTTPException(422, "请选择今天或更早的日期。")
             return learning_report(db, folder, today, period, anchor)
+
+    @router.get("/timers/{identity}/corrections")
+    def get_timer_corrections(identity: UUID, sourceOn: date | None = None):
+        with transaction(engine, write=False) as db:
+            return {"versions": correction_history(db, str(identity), sourceOn)}
 
     @router.put("/timers/{identity}/correction")
     def update_timer(identity: UUID, data: CorrectionInput):

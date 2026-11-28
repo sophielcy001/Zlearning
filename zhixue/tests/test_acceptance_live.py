@@ -3,6 +3,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from threading import Thread
+from time import sleep
 from uuid import uuid4
 
 import pytest
@@ -85,7 +86,7 @@ def encoded_reply(reply):
 
 
 @contextmanager
-def model_fixture(case, echo=False, *, abandon_reply=None):
+def model_fixture(case, echo=False, *, abandon_reply=None, draft_sections=1, objective_delay=0):
     sample = SAMPLES[case]
     traffic = []
     quote = {"source": "S1", "quote": sample.source}
@@ -93,10 +94,15 @@ def model_fixture(case, echo=False, *, abandon_reply=None):
         {"key": "example", "title": sample.title, "outcome": sample.outcome},
         {"key": "more", "title": "延伸示例", "outcome": "独立完成例题", "prerequisites": ["example"]},
     ]}]}
-    draft = {"sections": [{"title": "规则和例题", "text": sample.source, "checks": ["例题计算"]}]}
+    draft = {"sections": [
+        {"title": "规则和例题" if index == 0 else f"规则和例题 {index + 1}",
+         "text": sample.source, "checks": ["例题计算"]}
+        for index in range(draft_sections)
+    ]}
     finding = {"sections": [
-        {"index": 0, "verdict": "supported", "reason": "样本资料摘要包含所需内容。",
-         "citations": [quote], "dependsOn": []},
+        {"index": index, "verdict": "supported", "reason": "样本资料摘要包含所需内容。",
+         "citations": [quote], "dependsOn": []}
+        for index in range(draft_sections)
     ]}
     answer = {"answer": sample.answer, "support": "grounded", "citations": [quote]}
     addition = {"section": {"title": "答疑补充", "text": sample.answer, "checks": ["例题计算"]}}
@@ -131,6 +137,8 @@ def model_fixture(case, echo=False, *, abandon_reply=None):
                 return
             if abandon_reply is not None and abandon_reply(marker):
                 return
+            if objective_delay and marker == "拟定可独立检验":
+                sleep(objective_delay)
             wire = json.dumps(encoded_reply(result), ensure_ascii=False).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -199,6 +207,32 @@ def test_live_environment_uses_the_real_worker_and_http_credential_flow(tmp_path
             ) == authorization and not echoed for marker, model, authorization, echoed in traffic)
 
 
+def test_live_budget_waits_for_all_serial_assessment_jobs(tmp_path):
+    # Five successful responses take over 42 seconds in aggregate at concurrency one.
+    with model_fixture("sqlite", draft_sections=4, objective_delay=9) as (endpoint, traffic, markers):
+        data = profiles()
+        data["main"]["endpoint"] = data["review"]["endpoint"] = endpoint
+        price = {"currency": "CNY", "inputPerMillion": "0", "outputPerMillion": "0"}
+        data["budget"] = {"limit": {"currency": "CNY", "amount": "1"},
+                          "mainPricing": price, "reviewPricing": price}
+        store = RunStore(tmp_path)
+        with TestClient(create_app(store, TOKEN), base_url="http://127.0.0.1") as http:
+            accepted = http.post("/api/real-runs", headers=HEADERS, json=data)
+            assert accepted.status_code == 202, accepted.text
+            store.wait()
+            run = store.read(accepted.json()["id"])
+            records = {item["step"]: item for item in run["records"]}
+            review = records["real-review"]
+            assert review["output"]["出题依据片段数"] == 5
+            assert run["state"] == "passed", (run["reason"], review, [phase for phase, *_ in traffic])
+            assert review["status"] == "passed" and review["elapsedMs"] >= 45000
+            assert records["real-schedule"]["output"]["复习阶段"] == 1
+            usage = records["real-usage"]["output"]
+            assert usage["计入调用"] == usage["收到用量的调用"] == 12
+            assert usage["待结算调用"] == 0
+            assert [phase for phase, *_ in traffic] == [*markers[:-2], *([markers[-2]] * 5), markers[-1]]
+
+
 def test_live_transport_caps_concurrent_outbound_attempts(monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
 
@@ -216,6 +250,24 @@ def test_live_transport_caps_concurrent_outbound_attempts(monkeypatch):
         statuses = list(pool.map(lambda number: send("http://127.0.0.1:1", {}, {"request": number})[0], range(6)))
     assert sorted(statuses) == [200, 200, 429, 429, 429, 429]
     assert len(attempts) == 2
+
+
+def test_live_transport_rechecks_shutdown_after_the_usage_checkpoint(monkeypatch):
+    from threading import Event
+
+    from acceptance.live_runtime import capped_transport
+    from backend.model_protocols import TransportNotSent
+
+    shutdown = Event()
+    outbound = []
+    monkeypatch.setattr("acceptance.live_runtime.post_json", lambda *args: outbound.append(args))
+    send = capped_transport(2, shutdown.set, stopped=shutdown)
+
+    with pytest.raises(TransportNotSent):
+        send("http://127.0.0.1:1", {}, {})
+    with pytest.raises(TransportNotSent):
+        send("http://127.0.0.1:1", {}, {})
+    assert outbound == []
 
 
 def test_live_report_preserves_ledger_costs_and_leaves_missing_charges_unknown(tmp_path):
@@ -670,12 +722,14 @@ open_db = fail_open
             (tmp_path / "worker-failure-report.md").write_bytes(report.content)
 
 
-def test_parent_termination_preserves_observed_model_usage_without_replaying_calls(tmp_path):
+@pytest.mark.parametrize("graceful", [False, True], ids=["process-kill", "graceful-disconnect"])
+def test_parent_termination_preserves_observed_model_usage_without_replaying_calls(tmp_path, graceful):
     import os
     import subprocess
     import sys
     from queue import Queue
     from threading import Event
+    from time import monotonic, sleep
     from urllib.parse import urlsplit
 
     import httpx2
@@ -687,7 +741,7 @@ def test_parent_termination_preserves_observed_model_usage_without_replaying_cal
             return False
         answer_received.set()
         release.wait(timeout=35)
-        return True
+        return not graceful
 
     history = tmp_path / "history"
     scratch = tmp_path / "runtime"
@@ -715,8 +769,24 @@ def test_parent_termination_preserves_observed_model_usage_without_replaying_cal
                     pending = json.loads(original)
                     assert pending["state"] == "running"
                     assert all(step["step"] != "real-usage" for step in pending["records"])
-                    process.kill()
-                    assert process.wait(timeout=10) != 0
+                    if graceful:
+                        process.stdin.close()
+                        deadline = monotonic() + 10
+                        while monotonic() < deadline:
+                            try:
+                                api.get("/api/runs", headers=auth, timeout=1)
+                            except httpx2.TransportError:
+                                break
+                            sleep(.05)
+                        else:
+                            pytest.fail("Acceptance listener did not close.")
+                        release.set()
+                        assert process.wait(timeout=55) == 0
+                        assert len(traffic) == 4, [marker for marker, *_ in traffic]
+                        original = (history / f"{identity}.json").read_bytes()
+                    else:
+                        process.kill()
+                        assert process.wait(timeout=10) != 0
 
                 with TestClient(create_app(RunStore(history), TOKEN), base_url="http://127.0.0.1") as reopened:
                     url = f"/api/runs/{identity}"
@@ -726,23 +796,27 @@ def test_parent_termination_preserves_observed_model_usage_without_replaying_cal
                     assert nodes["real-publish"]["status"] == "passed"
                     assert nodes["real-answer"]["status"] == "interrupted"
                     usage = nodes["real-usage"]
-                    assert usage["status"] == "interrupted"
+                    assert usage["status"] == ("passed" if graceful else "interrupted")
                     assert usage["output"]["计入调用"] == len(traffic) == 4
-                    assert usage["output"]["收到用量的调用"] == 3
-                    assert usage["output"]["证据范围"]
+                    assert usage["output"]["收到用量的调用"] == (4 if graceful else 3)
+                    if not graceful:
+                        assert usage["output"]["证据范围"]
                     assert usage["output"]["调用记录"][-1]["阶段"] == "lesson_answer"
                     last = usage["output"]["调用记录"][-1]
                     assert last["模型分工"] == "主模型" and last["账本开始时间（UTC）"].endswith("Z")
-                    assert last["结算记录时间（UTC）"] is None
+                    assert (last["结算记录时间（UTC）"] is not None) == graceful
                     assert "独立复核模型" in [call["模型分工"] for call in usage["output"]["调用记录"]]
                     report = reopened.get(url + "/report", headers=HEADERS)
-                    assert report.is_success and "用量快照" in report.text and KEY not in report.text
+                    assert report.is_success and KEY not in report.text
+                    assert ("用量快照" in report.text) != graceful
+                    billing = reopened.get(url + "/billing", headers=HEADERS)
+                    assert billing.is_success and "lesson_answer" in billing.text and KEY not in billing.text
                     assert (history / f"{identity}.json").read_bytes() == original
                     checks = {"facts": "confirmed", "evidence": "insufficient", "boundary": "disputed"}
                     quality = reopened.put(url + "/quality", headers=HEADERS, json={"checks": checks})
                     assert quality.is_success and quality.json()["courseVersion"] == 1
                     stored = json.loads((history / f"{identity}.json").read_bytes())
-                    assert all(node["step"] != "real-usage" for node in stored["records"])
+                    assert any(node["step"] == "real-usage" for node in stored["records"]) == graceful
                     amended = reopened.get(url, headers=HEADERS).json()
                     assert amended["quality"]["checks"] == checks
                     assert amended["records"][-1]["output"]["计入调用"] == 4

@@ -2,7 +2,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync,
-  renameSync, rmSync, writeFileSync } from 'node:fs';
+  renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -18,7 +18,7 @@ const python = resolve(process.platform === 'win32' ? '.venv/Scripts/python.exe'
 
 const home = '今天，想弄懂什么？';
 const oldSchema = '0051_course_anchor_links';
-const newSchema = '0052_recognition_grants';
+let migrationHead: string | undefined;
 const noteText = '宏观迁移验收。每行代表一条独立记录。';
 const originalText = '安装验收隔离资料，表由记录和字段组成。';
 const password = 'installed app isolated archive fixture only';
@@ -36,9 +36,9 @@ function schedule({ lessonId, key, title, stage, dueOn }: ReviewSchedule) {
 }
 
 function readSqlite(file: string, statement: string) {
-  if (process.platform === 'darwin') {
-    return execFileSync('/usr/bin/sqlite3', ['-readonly', file, statement], { encoding: 'utf8' }).trim();
-  }
+  // Apple's /usr/bin/sqlite3 -readonly returns SQLITE_CANTOPEN (14) for a WAL
+  // database whose -wal and -shm files were removed on a clean close. The
+  // locked Python SQLite creates the shared-memory file for a read-only URI.
   return execFileSync(python, ['-c',
     'from pathlib import Path; import sqlite3, sys; ' +
     'db = sqlite3.connect(Path(sys.argv[1]).as_uri() + "?mode=ro", uri=True); ' +
@@ -48,6 +48,16 @@ function readSqlite(file: string, statement: string) {
 
 function schema(file: string) {
   return readSqlite(file, 'SELECT version_num FROM alembic_version');
+}
+
+function expectedMigrationHead() {
+  migrationHead ??= process.env.ZHIXUE_TEST_MIGRATION_HEAD ?? execFileSync(python, ['-c', [
+    'from alembic.script import ScriptDirectory',
+    'from backend.db import ROOT',
+    'print(ScriptDirectory(str(ROOT / "migrations")).get_current_head())',
+  ].join('\n')], { encoding: 'utf8', windowsHide: true }).trim();
+  expect(migrationHead).toMatch(/^\d{4}_[a-z0-9_]+$/);
+  return migrationHead;
 }
 
 function downgradeFixture(workspace: string) {
@@ -208,7 +218,7 @@ async function verifyRestoredWorkspace(
   expect((await wire(page, '/projects/' + missing.projectId)).status()).toBe(404);
   expect((await wire(page, '/files/' + missing.originalId)).status()).toBe(404);
   const database = join(folder, 'zhixue.sqlite3');
-  expect(schema(database)).toBe(newSchema);
+  expect(schema(database)).toBe(expectedMigrationHead());
   expect(readSqlite(database, 'PRAGMA quick_check')).toBe('ok');
 }
 
@@ -392,7 +402,7 @@ test('the installed Electron app migrates, completes a review, and restores to a
     const db = join(workspace, 'zhixue.sqlite3');
     const courseFile = join(workspace, 'library', 'courses', fixture.lessonId + '.md');
     if (schemaFixture) {
-      expect(schema(db)).toBe(newSchema);
+      expect(schema(db)).toBe(expectedMigrationHead());
       downgradeFixture(workspace);
     }
     expect(schema(db)).toBe(oldSchema);
@@ -407,7 +417,7 @@ test('the installed Electron app migrates, completes a review, and restores to a
 
     await withApp(control, async page => {
       await expect(page.getByRole('heading', { name: home })).toBeVisible();
-      expect(schema(db)).toBe(newSchema);
+      expect(schema(db)).toBe(expectedMigrationHead());
       const upgrades = join(workspace, 'backups', 'database-upgrades');
       const [oldCopy] = readdirSync(upgrades).filter(name => name.endsWith('.sqlite3'));
       expect(oldCopy, 'Migration should leave a readable pre-upgrade SQLite copy').toBeTruthy();
@@ -420,7 +430,7 @@ test('the installed Electron app migrates, completes a review, and restores to a
         expect.any(Object), expect.any(Object),
       ] });
       expect((await api(page, '/reviews')).reviews.map(schedule)).toEqual(fixture.reviews);
-      console.log('PASS 0051 → 0052, pre-upgrade SQLite, source course, note, progress and review due dates');
+      console.log('PASS 0051 → ' + expectedMigrationHead() + ', pre-upgrade SQLite, source course, note, progress and review due dates');
 
       await page.evaluate(path => { location.hash = path; }, lesson);
       await expect(page.getByRole('heading', { name: '一张表能记下什么' })).toBeVisible();
@@ -489,7 +499,7 @@ test('the installed Electron app migrates, completes a review, and restores to a
     await withApp(receiver, async page => {
       await expect(page.getByRole('heading', { name: home })).toBeVisible();
       const restoredDb = join(receiverWorkspace, 'zhixue.sqlite3');
-      expect(schema(restoredDb)).toBe(newSchema);
+      expect(schema(restoredDb)).toBe(expectedMigrationHead());
       expect(readSqlite(restoredDb, 'PRAGMA quick_check')).toBe('ok');
       expect(readSqlite(restoredDb, 'SELECT count(*) FROM model_charges')).toBe('0');
       expect(digest(join(receiverWorkspace, 'library', 'courses', fixture.lessonId + '.md'))).toBe(courseDigest);
@@ -857,13 +867,110 @@ test('the installed Electron app locates mixed-script search hits and recovers f
   }
 });
 
+test('the installed Electron app preserves wiki search context and original location', async ({}, info) => {
+  test.skip(!installed, 'Set ZHIXUE_TEST_ELECTRON to run against an installed app');
+  const temp = realpathSync(tmpdir());
+  const folder = realpathSync(mkdtempSync(join(temp, 'zhixue-installed-wiki-')));
+  expect(dirname(folder)).toBe(temp);
+  const q = '安装检索续接样本';
+  const conditions = { q, scope: 'all', folder: 'library/imports', format: 'md' };
+  const parse = (page: Page) => new URLSearchParams(new URL(page.url()).hash.split('?')[1]);
+  const navigate = (page: Page, hash: string) => page.evaluate(value => { location.hash = value; }, hash);
+  async function checkSearch(page: Page) {
+    await expect(page.getByRole('searchbox', { name: '搜索知识库' })).toHaveValue(q);
+    for (const [key, value] of Object.entries(conditions)) expect(parse(page).get(key)).toBe(value);
+    await expect(page.locator('.library-list .library-file strong')).toHaveText(['安装验收原文.md']);
+  }
+  const targetText = '目标文件的第三行。';
+  let savedHash: string;
+  let targetVersion: string;
+  let targetId: string;
+
+  async function checkTarget(page: Page) {
+    await expect(page.locator('.library-preview .file-anchor')).toContainText(targetText);
+    await checkSearch(page);
+    expect(parse(page).get('file')).toBe(targetId);
+    expect(parse(page).get('at')).toBe('3');
+    expect(parse(page).get('revision')).toBe(targetVersion);
+  }
+
+  try {
+    await withApp(folder, async page => {
+      await page.getByRole('button', { name: '使用此位置', exact: true }).click();
+      await page.getByRole('button', { name: '稍后配置模型', exact: true }).click();
+      await expect(page.getByRole('heading', { name: home })).toBeVisible();
+      const target = await api(page, '/files', 'POST', { name: '安装参考入口.md', content: '# 安装参考段落\n\n' + targetText });
+      targetId = target.id;
+      targetVersion = (await api(page, '/files/' + targetId)).revision;
+      expect(targetVersion).toMatch(/^[a-f0-9]{64}$/);
+      const choice = await api(page, '/files', 'POST', { name: '同名安装资料.md', content: '# 甲版安装资料' });
+      await api(page, '/files', 'POST', { name: '同名安装资料.md', content: '# 乙版安装资料' });
+      const link = '#/library?' + new URLSearchParams({ file: targetId, at: '3', revision: targetVersion });
+      const source = await api(page, '/files', 'POST', {
+        name: '安装验收原文.md',
+        content: '# 安装验收原文\n\n' + q + ' [[安装参考入口]]、[[同名安装资料]]，再读[指定原文](' + link + ')。',
+      });
+
+      await navigate(page, '#/library?' + new URLSearchParams({ folder: conditions.folder }));
+      await page.getByRole('combobox', { name: '搜索范围' }).selectOption('all');
+      await page.getByRole('combobox', { name: '文件类型' }).selectOption('md');
+      await page.getByRole('searchbox', { name: '搜索知识库' }).fill(q);
+      const preview = page.locator('.library-preview');
+      const anchor = preview.locator('.file-anchor');
+      await page.getByRole('button', { name: /安装验收原文\.md.*第 3 行/ }).click();
+      await expect(anchor).toContainText(q);
+      const sourceVersion = parse(page).get('revision');
+      expect(sourceVersion).toMatch(/^[a-f0-9]{64}$/);
+      await preview.getByRole('link', { name: '[[安装参考入口]]', exact: true }).click();
+      await expect(preview.getByRole('heading', { name: '安装参考段落' })).toBeVisible();
+      await checkSearch(page);
+      expect(parse(page).get('file')).toBe(targetId);
+      expect(parse(page).get('at')).toBeNull();
+      expect(parse(page).get('revision')).toBeNull();
+
+      await preview.getByText('反向链接', { exact: true }).click();
+      await preview.getByRole('link', { name: '安装验收原文.md · 第 3 行' }).click();
+      await expect(anchor).toContainText(q);
+      await checkSearch(page);
+      expect(parse(page).get('file')).toBe(source.id);
+      expect(parse(page).get('at')).toBe('3');
+      expect(parse(page).get('revision')).toBe(sourceVersion);
+
+      await preview.getByRole('link', { name: '[[同名安装资料]]', exact: true }).click();
+      await expect(preview.getByText('有多个文件匹配「同名安装资料」。请选择要打开的文件。')).toBeVisible();
+      await checkSearch(page);
+      await preview.getByRole('link', { name: new RegExp(choice.id) }).click();
+      await expect(preview.getByRole('heading', { name: '甲版安装资料', exact: true })).toBeVisible();
+      await checkSearch(page);
+
+      await page.goBack();
+      await preview.getByRole('link', { name: '指定原文', exact: true }).click();
+      await checkTarget(page);
+      await page.reload();
+      await checkTarget(page);
+      savedHash = new URL(page.url()).hash;
+    });
+
+    await withApp(folder, async page => {
+      await expect(page.getByRole('heading', { name: home })).toBeVisible();
+      await navigate(page, savedHash);
+      await checkTarget(page);
+      await page.screenshot({ path: info.outputPath('安装版双链检索续接.png') });
+    });
+  } finally {
+    rmSync(folder, { force: true, recursive: true, maxRetries: 5, retryDelay: 200 });
+  }
+});
+
 test('the installed Electron app retains one overdue review with its grading delay after restart', async ({}, info) => {
   test.skip(!installed, 'Set ZHIXUE_TEST_ELECTRON to run against an installed app');
   const temp = realpathSync(tmpdir());
   const folder = realpathSync(mkdtempSync(join(temp, 'zhixue-installed-late-grade-')));
   expect(dirname(folder)).toBe(temp);
   type PlannedReview = { lessonId: string; key: string; kind: string; dueOn: string };
-  let expected: Omit<PlannedReview, 'kind'> & { title: string };
+  let expected: Omit<PlannedReview, 'kind'> & {
+    title: string; lessonTitle: string; submittedOn: string; scoredOn: string; groupId: string;
+  };
   async function verifyReview(page: Page) {
     await page.getByRole('link', { name: '今日复习', exact: true }).click();
     const row = page.locator('.review-row').filter({ has: page.getByText(expected.title, { exact: true }) });
@@ -875,6 +982,29 @@ test('the installed Electron app retains one overdue review with its grading del
     const matching = plan.days.flatMap(day => day.tasks)
       .filter(task => task.kind === 'review' && task.lessonId === expected.lessonId && task.key === expected.key);
     expect(matching.map(task => task.dueOn)).toEqual([expected.dueOn]);
+  }
+  async function verifyFormalReport(page: Page) {
+    const query = 'period=day&on=' + expected.submittedOn;
+    const report = await api(page, '/study-report?' + query);
+    expect(report.totals.review).toEqual({ passed: 1, hinted: 0, failed: 0, ungraded: 0 });
+    expect(report.reviewRecords).toHaveLength(1);
+    expect(report.reviewRecords[0]).toMatchObject({
+      lessonId: expected.lessonId, key: expected.key, on: expected.submittedOn, outcome: 'passed',
+      round: 1, groupId: expected.groupId, title: expected.title,
+    });
+    const scoreDay = await api(page, '/study-report?period=day&on=' + expected.scoredOn);
+    expect(scoreDay.totals.review).toEqual({ passed: 0, hinted: 0, failed: 0, ungraded: 0 });
+    expect(scoreDay.reviewRecords).toEqual([]);
+
+    await page.evaluate(query => { location.hash = '/study-report?' + query; }, query);
+    await page.getByRole('button', { name: '查看独立通过的正式复习记录', exact: true }).click();
+    const detail = page.getByRole('region', { name: '正式复习记录', exact: true });
+    await expect(detail.getByRole('combobox', { name: '复习结果' })).toHaveValue('passed');
+    const row = detail.getByRole('listitem');
+    await expect(row).toHaveCount(1);
+    await expect(row.getByText(expected.title, { exact: true })).toBeVisible();
+    await expect(row.getByRole('link', { name: expected.lessonTitle, exact: true }))
+      .toHaveAttribute('href', '#/lessons/' + expected.lessonId);
   }
   try {
     await withApp(folder, async page => {
@@ -930,15 +1060,24 @@ with local_models() as (models, address):
     assert result["outcome"] == "passed" and result["gradingDelayed"] and result["dueOn"] == expected
     assert result["scoredOn"] > expected
     print(json.dumps({"dueOn": expected, "title": due["title"], "lessonId": due["lessonId"],
-                      "key": due["key"]}, ensure_ascii=False))
+                      "key": due["key"], "lessonTitle": next(item["title"] for item in api.get(project)["lessons"]
+                                          if item["id"] == due["lessonId"]),
+                      "submittedOn": result["submittedOn"], "scoredOn": result["scoredOn"],
+                      "groupId": objective["group"]["id"]}, ensure_ascii=False))
 `], { input: JSON.stringify([origin, token, info.outputPath('fixture')]), encoding: 'utf8', windowsHide: true,
         timeout: 150000, env: { ...process.env, PYTHONUTF8: '1', NO_PROXY: '127.0.0.1' } });
       expected = JSON.parse(output);
       await verifyReview(page);
+      await verifyFormalReport(page);
     });
     await withApp(folder, async page => {
       await expect(page.getByRole('heading', { name: home })).toBeVisible();
       await verifyReview(page);
+      await test.step('reads formal review details on the original submission day after restart', async () => {
+        await verifyFormalReport(page);
+        await page.getByRole('region', { name: '正式复习记录', exact: true })
+          .screenshot({ path: info.outputPath('安装版正式复习明细.png') });
+      });
       console.log('PASS restarted installed service shows one delayed review on the date derived from its actual submission');
     });
   } finally {
@@ -1110,6 +1249,7 @@ test('the installed Electron app protects a concurrent OCR correction and its so
   const kept = '另一窗口确认的原文 937';
   const draftText = '旧草稿待处理 618';
   const corrected = '重新核对后的扫描文字 249';
+  const later = '翻页后才返回的扫描校对 367';
   const pdf = execFileSync(python, ['-c', [
     'import pymupdf, sys',
     'with pymupdf.open() as text, pymupdf.open() as scan:',
@@ -1146,48 +1286,572 @@ test('the installed Electron app protects a concurrent OCR correction and its so
       expect((await api(page, search('Installed Scan'))).hits).toEqual([]);
       await draft.fill(draftText);
 
-      const other = await api(page, ocr, 'PUT', { revision: original.revision, textRevision: null, text: kept });
-      await preview.getByRole('button', { name: '收藏文件' }).click();
-      await expect(preview.locator('.file-anchor')).toContainText(kept);
-      await expect(draft).toHaveValue(draftText);
-      const saving = page.waitForResponse(response => new URL(response.url()).pathname === '/api' + ocr
-        && response.request().method() === 'PUT');
-      await editor.getByRole('button', { name: '保存校对文字' }).click();
-      expect((await saving).status()).toBe(409);
-      await expect(editor.getByRole('alert')).toContainText('识别文本已在其他窗口保存');
-      await expect(draft).toHaveValue(draftText);
-      const saved = await api(page, path + '?at=1');
-      expect(saved.anchor).toMatchObject({ text: kept, textRevision: other.textRevision });
-      expect((await api(page, search(draftText))).hits).toEqual([]);
+      const correctionFromOtherWindow = await test.step('keeps a competing OCR correction and the unchanged original', async () => {
+        const other = await api(page, ocr, 'PUT', { revision: original.revision, textRevision: null, text: kept });
+        await preview.getByRole('button', { name: '收藏文件' }).click();
+        await expect(preview.locator('.file-anchor')).toContainText(kept);
+        await expect(draft).toHaveValue(draftText);
+        const rejected = page.waitForResponse(response => new URL(response.url()).pathname === '/api' + ocr
+          && response.request().method() === 'PUT');
+        await editor.getByRole('button', { name: '保存校对文字' }).click();
+        expect((await rejected).status()).toBe(409);
+        await expect(editor.getByRole('alert')).toContainText('识别文本已在其他窗口保存');
+        await expect(draft).toHaveValue(draftText);
+        const saved = await api(page, path + '?at=1');
+        expect(saved.anchor).toMatchObject({ text: kept, textRevision: other.textRevision });
+        expect((await api(page, search(draftText))).hits).toEqual([]);
+        const originalBytes = await wire(page, path + '/original');
+        expect(originalBytes.ok()).toBe(true);
+        expect(await originalBytes.body()).toEqual(pdf);
+        return other.textRevision;
+      });
 
-      await editor.getByRole('button', { name: '取消', exact: true }).click();
-      await editor.getByRole('button', { name: '编辑校对文字' }).click();
-      await expect(draft).toHaveValue(kept);
-      await draft.fill(corrected);
-      await editor.getByRole('button', { name: '保存校对文字' }).click();
-      await expect(preview.locator('.file-anchor')).toContainText(corrected);
-      const current = await api(page, path + '?at=1');
-      textRevision = current.anchor.textRevision;
-      expect(textRevision).not.toBe(other.textRevision);
-      const response = await wire(page, path + '/original');
-      expect(response.ok()).toBe(true);
-      expect(await response.body()).toEqual(pdf);
-      console.log('PASS packaged OCR protects a concurrent correction and leaves the PDF source unchanged');
-    });
-    await withApp(folder, async page => {
-      await expect(page.getByRole('heading', { name: home })).toBeVisible();
-      await page.getByRole('link', { name: '知识库', exact: true }).click();
+      async function saveWhile(navigate: () => Promise<void>) {
+        const target = (url: URL) => url.pathname === '/api' + ocr;
+        const { promise: started, resolve: markStarted } = Promise.withResolvers<void>();
+        const { promise: released, resolve: release } = Promise.withResolvers<void>();
+        await page.route(target, async route => {
+          if (route.request().method() !== 'PUT') return route.fallback();
+          markStarted();
+          await released;
+          await route.continue();
+        });
+        const response = page.waitForResponse(reply => target(new URL(reply.url())) && reply.request().method() === 'PUT');
+        try {
+          await editor.getByRole('button', { name: '保存校对文字' }).click();
+          await started;
+          await navigate();
+        } finally {
+          release();
+        }
+        expect((await response).status()).toBe(200);
+        return () => page.unroute(target);
+      }
+
       const box = page.getByRole('searchbox', { name: '搜索知识库' });
-      await box.fill(corrected);
-      await page.getByRole('button', { name: /安装版扫描件\.pdf.*第 1 页 · 已校对 OCR/ }).click();
-      const preview = page.locator('.library-preview');
-      await expect(preview.locator('.file-anchor')).toContainText(corrected);
-      await expect(preview.getByText('第 2 页无可提取文字')).toBeVisible();
-      const reopened = await api(page, '/files/' + id + '?at=1');
-      expect(reopened.anchor).toMatchObject({ text: corrected, textRevision });
-      console.log('PASS restarted installed app searches the confirmed page using the saved OCR revision');
+      const scope = page.getByRole('combobox', { name: '搜索范围' });
+      const hit = page.getByRole('button', { name: /安装版扫描件\.pdf.*第 1 页 · 已校对 OCR/ });
+      const earlierRevision = await test.step('preserves the active search while saving the correction', async () => {
+        await editor.getByRole('button', { name: '取消', exact: true }).click();
+        await editor.getByRole('button', { name: '编辑校对文字' }).click();
+        await expect(draft).toHaveValue(kept);
+        await draft.fill(corrected);
+        const releaseRoute = await saveWhile(async () => {
+          await box.fill(corrected);
+          await scope.selectOption('all');
+          await expect.poll(() => page.evaluate(() => {
+            const current = new URLSearchParams(location.hash.split('?')[1]);
+            return [current.get('q'), current.get('scope')];
+          })).toEqual([corrected, 'all']);
+        });
+        await expect(preview.locator('.file-anchor')).toContainText(corrected);
+        await expect(box).toHaveValue(corrected);
+        await expect(scope).toHaveValue('all');
+        await expect(hit).toBeVisible();
+        await releaseRoute();
+        const current = await api(page, path + '?at=1');
+        expect(current.anchor.text).toBe(corrected);
+        expect(current.anchor.textRevision).not.toBe(correctionFromOtherWindow);
+        return current.anchor.textRevision;
+      });
+
+      await test.step('keeps the chosen page when a pending OCR save finishes', async () => {
+        await box.fill(later);
+        await expect(page.getByText('没有匹配的内容')).toBeVisible();
+        await editor.getByRole('button', { name: '编辑校对文字' }).click();
+        await draft.fill(later);
+        const second = page.getByRole('img', { name: 'PDF 原件第 2 页' });
+        const releaseRoute = await saveWhile(async () => {
+          await preview.getByRole('button', { name: '下一页' }).click();
+          await expect(second).toBeVisible();
+        });
+        const saved = await api(page, path + '?at=1');
+        expect(saved.anchor.text).toBe(later);
+        expect((await api(page, search(later))).hits).toEqual([expect.objectContaining({
+          id, location: expect.objectContaining({ number: 1, textRevision: saved.anchor.textRevision }),
+        })]);
+        await expect(hit).toBeVisible();
+        await expect(second).toBeVisible();
+        await releaseRoute();
+        await expect(box).toHaveValue(later);
+        await hit.click();
+        await expect(preview.getByRole('img', { name: 'PDF 原件第 1 页' })).toBeVisible();
+        await expect(preview.locator('.file-anchor')).toContainText(later);
+        const confirmed = await api(page, path + '?at=1');
+        textRevision = confirmed.anchor.textRevision;
+        expect(textRevision).not.toBe(earlierRevision);
+        expect(new URLSearchParams(new URL(page.url()).hash.split('?')[1]).get('revision')).toBe(textRevision);
+      });
+    });
+    await test.step('reopens the corrected page and original after restart', async () => {
+      await withApp(folder, async page => {
+        await expect(page.getByRole('heading', { name: home })).toBeVisible();
+        await page.getByRole('link', { name: '知识库', exact: true }).click();
+        await page.getByRole('searchbox', { name: '搜索知识库' }).fill(later);
+        await page.getByRole('button', { name: /安装版扫描件\.pdf.*第 1 页 · 已校对 OCR/ }).click();
+        const preview = page.locator('.library-preview');
+        await expect(preview.locator('.file-anchor')).toContainText(later);
+        await expect(preview.getByText('第 2 页无可提取文字')).toBeVisible();
+        const reopened = await api(page, '/files/' + id + '?at=1');
+        expect(reopened.anchor).toMatchObject({ text: later, textRevision });
+        const originalBytes = await wire(page, '/files/' + id + '/original');
+        expect(originalBytes.ok()).toBe(true);
+        expect(await originalBytes.body()).toEqual(pdf);
+      });
     });
   } finally {
     rmSync(folder, { force: true, recursive: true, maxRetries: 5, retryDelay: 200 });
+  }
+});
+
+test('the installed Electron app recalibrates and replays an offline timer after restart', async ({}, info) => {
+  test.skip(!installed, 'Set ZHIXUE_TEST_ELECTRON to run against an installed app');
+  type Ledger = Awaited<ReturnType<typeof import('../src/mobile-timer').timerLedger>>;
+  type TimerEvent = import('../src/mobile-timer').PhoneTimerEvent;
+  type Receipt = { id: string; state: 'held' | 'saved' | 'resolved'; seconds: number; reason?: string };
+  type Trace = { clockReads: number; sent: { clockReads: number; event: TimerEvent }[]; pause?: Receipt };
+  const parent = realpathSync(tmpdir());
+  const folder = realpathSync(mkdtempSync(join(parent, 'zhixue-installed-timer-clock-')));
+  const database = join(folder, 'zhixue.sqlite3');
+  const offlineDatabase = join(folder, 'profile', 'offline-study.sqlite3');
+  const delayMs = 2350;
+  const button = (page: Page, name: string) => page.getByRole('button', { name, exact: true });
+  const timer = (page: Page) => page.getByRole('region', { name: '本机计时', exact: true });
+  const queue = (ledger: Ledger) => ledger.events.map(event => event.action);
+  let timerId = '';
+  let workspace: string;
+  let expectedIds: string[];
+  let pendingAfterLoss: Ledger;
+  let pauseSeconds: number;
+  let pausedMilliseconds: number;
+
+  function ledger(page: Page): Promise<Ledger> {
+    return page.evaluate(async () => (await window.zhixueDesktop!.offline!.read('timers', 'ledger')).value as Ledger ??
+      { events: [], clocks: {} });
+  }
+
+  function receipts() {
+    expect(timerId).toMatch(/^[0-9a-f-]{36}$/);
+    return JSON.parse(readSqlite(database, `
+      SELECT json_group_array(json(item)) FROM (
+        SELECT json_object('action', json_extract(details, '$.action'), 'reply', json(reply)) AS item
+        FROM mobile_changes WHERE kind = 'timer' AND json_extract(details, '$.timerId') = '${timerId}'
+        ORDER BY received_at, id
+      )`)) as { action: TimerEvent['action']; reply: Receipt }[];
+  }
+
+  async function reportedSeconds(page: Page) {
+    const report = await api(page, '/study-report?period=month');
+    return (report.timeRecords as { timerId: string; category: string; seconds: number }[])
+      .filter(entry => entry.timerId === timerId && entry.category === 'notes')
+      .reduce((seconds, entry) => seconds + entry.seconds, 0);
+  }
+
+  function duration(event: TimerEvent) {
+    expect(event.span?.reliable).toBe(true);
+    const { beganAt, endedAt } = event.span!;
+    return Math.floor(Date.parse(endedAt) / 1000) - Math.floor(Date.parse(beganAt) / 1000);
+  }
+
+  async function synchronize(page: Page) {
+    await button(page, '同步').click();
+    await button(page, '同步到电脑').click();
+  }
+
+  async function startOfflinePage(page: Page, staging: { blocked: boolean; delay: boolean; trace?: Trace }) {
+    const base = new URL(page.url()).origin;
+    const match = (pathname: string) => (url: URL) => url.origin === base && url.pathname === pathname;
+    const token = await page.evaluate(() => sessionStorage.getItem('zhixue-session'));
+    expect(token).toBeTruthy();
+    await page.route(match('/api/mobile/catalog'), route => staging.blocked
+      ? route.fulfill({ status: 503, contentType: 'application/json', body: '{"detail":"验收期间暂缓计时同步。"}' })
+      : route.continue());
+    await page.route(match('/api/mobile/timer'), async route => {
+      const trace = staging.trace;
+      if (!trace) return route.continue();
+      const request = route.request();
+      if (request.method() === 'GET') {
+        trace.clockReads++;
+        if (!staging.delay || trace.clockReads !== 1) return route.continue();
+        const response = await route.fetch();
+        expect(response.ok()).toBe(true);
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+        return route.fulfill({ response });
+      }
+      const event = request.postDataJSON() as TimerEvent;
+      trace.sent.push({ clockReads: trace.clockReads, event });
+      if (!staging.delay || event.action !== 'pause') return route.continue();
+      const response = await route.fetch();
+      expect(response.ok()).toBe(true);
+      trace.pause = await response.json() as Receipt;
+      staging.blocked = true;
+      await route.abort('failed');
+    });
+    await page.goto(base + '/mobile/#/?session=' + encodeURIComponent(token!));
+    await expect(page.getByRole('heading', { name: '智学离线', exact: true })).toBeVisible();
+  }
+
+  async function waitActiveSeconds(page: Page, seconds: number) {
+    await expect.poll(async () => (await timer(page).locator('time').innerText()).split(':')
+      .reduce((total, unit) => total * 60 + Number(unit), 0)).toBeGreaterThanOrEqual(seconds);
+  }
+
+  try {
+    await withApp(folder, async page => {
+      await button(page, '使用此位置').click();
+      await button(page, '稍后配置模型').click();
+      await expect(page.getByRole('heading', { name: home })).toBeVisible();
+      const id = randomUUID();
+      await api(page, '/projects', 'POST', { id, topic: 'SQLite', outcome: '安装版离线计时校时验收' });
+      await expect.poll(async () => (await api(page, '/projects/' + id)).task.status, { timeout: 45000 }).toBe('ready');
+      const lesson = (await api(page, '/projects/' + id)).lessons[0];
+      await api(page, '/lessons/' + lesson.id + '/note', 'PUT', { content: '安装版计时验收笔记。' });
+      workspace = (await api(page, '/mobile/catalog')).workspace;
+
+      const staging: { blocked: boolean; delay: boolean; trace?: Trace } = { blocked: false, delay: true };
+      await startOfflinePage(page, staging);
+      await button(page, '下载课程 ' + lesson.title).click();
+      await expect(button(page, '打开课程 ' + lesson.title)).toBeVisible();
+      await expect.poll(async () => !!(await ledger(page)).clocks[workspace], { timeout: 12000 }).toBe(true);
+      staging.blocked = true;
+      await synchronize(page);
+      await expect(page.getByText('等待连接', { exact: true })).toBeVisible();
+      await button(page, '课程').click();
+      await button(page, '打开课程 ' + lesson.title).click();
+      await button(page, '开始笔记计时').click();
+      await waitActiveSeconds(page, 2);
+      await button(page, '暂停计时').click();
+      await expect(timer(page).getByText('计时已暂停', { exact: true })).toBeVisible();
+      const paused = await ledger(page);
+      timerId = paused.active!.id;
+      await new Promise(resolve => setTimeout(resolve, 2200));
+      await button(page, '继续计时').click();
+      await waitActiveSeconds(page, Math.floor(paused.active!.elapsed / 1000) + 2);
+      await button(page, '结束计时').click();
+      await expect(timer(page)).toHaveCount(0);
+      const queued = await ledger(page);
+      expect(queue(queued)).toEqual(['start', 'pause', 'resume', 'finish']);
+      expect(queued.events.every(event => event.timerId === timerId && event.at.stable && event.at.clock && !event.request)).toBe(true);
+      expectedIds = queued.events.map(event => event.id);
+      pausedMilliseconds = queued.events[2].at.wall - queued.events[1].at.wall;
+      expect(pausedMilliseconds).toBeGreaterThanOrEqual(2200);
+
+      await button(page, '同步').click();
+      await expect(button(page, '同步到电脑')).toBeEnabled();
+      const trace = staging.trace = { clockReads: 0, sent: [] } as Trace;
+      staging.blocked = false;
+      await synchronize(page);
+      await expect.poll(async () => queue(await ledger(page)), { timeout: 20000 }).toEqual(['pause', 'resume', 'finish']);
+      await expect.poll(() => trace.pause, { timeout: 20000 }).toBeTruthy();
+      await expect(button(page, '同步到电脑')).toBeEnabled();
+      pendingAfterLoss = await ledger(page);
+      await info.attach('延迟校时与丢失回执', { body: JSON.stringify({
+        delayMs, clockReadsBeforeUpload: trace.sent[0].clockReads, pause: trace.pause,
+        pending: queue(pendingAfterLoss),
+      }), contentType: 'application/json' });
+      expect(trace.sent.map(item => item.event.id)).toEqual(expectedIds.slice(0, 2));
+      expect(trace.sent[0].clockReads, 'A fresh timer sample must arrive before the first upload').toBe(2);
+      expect(trace.pause).toMatchObject({ id: expectedIds[1], state: 'saved', seconds: duration(trace.sent[1].event) });
+      pauseSeconds = trace.pause!.seconds;
+      expect(pauseSeconds).toBeGreaterThanOrEqual(2);
+      expect(pendingAfterLoss.events[0].request).toEqual(trace.sent[1].event);
+      expect(receipts().map(item => item.reply.id)).toEqual(expectedIds.slice(0, 2));
+      expect(await reportedSeconds(page)).toBe(0);
+    });
+    await withApp(folder, async page => {
+      const staging = { blocked: true, delay: false, trace: { clockReads: 0, sent: [] } as Trace };
+      await expect(page.getByRole('heading', { name: home })).toBeVisible();
+      await startOfflinePage(page, staging);
+      await button(page, '同步').click();
+      await expect(page.getByText('3 次计时操作待同步。', { exact: true })).toBeVisible();
+      expect(await ledger(page)).toEqual(pendingAfterLoss);
+      await expect(button(page, '同步到电脑')).toBeEnabled();
+      staging.blocked = false;
+      await synchronize(page);
+      await expect(page.getByText(/次计时操作待同步/)).toHaveCount(0, { timeout: 20000 });
+      await expect(button(page, '同步到电脑')).toBeEnabled();
+      expect(staging.trace.sent.map(item => item.event.id)).toEqual(expectedIds.slice(1));
+      expect(staging.trace.sent[0].event).toEqual(pendingAfterLoss.events[0].request);
+      const saved = receipts();
+      expect(saved.map(item => item.action)).toEqual(['start', 'pause', 'resume', 'finish']);
+      expect(saved.map(item => item.reply.id)).toEqual(expectedIds);
+      expect(saved.every(item => item.reply.state === 'saved')).toBe(true);
+      const finishSeconds = duration(staging.trace.sent[2].event);
+      expect(finishSeconds).toBeGreaterThanOrEqual(2);
+      expect(saved[1].reply.seconds).toBe(pauseSeconds);
+      expect(saved[3].reply.seconds).toBe(finishSeconds);
+      const seconds = await reportedSeconds(page);
+      expect(seconds).toBe(pauseSeconds + finishSeconds);
+      expect(await api(page, '/mobile/timer?' + new URLSearchParams({ workspace }))).toMatchObject({
+        active: null, pendingReview: 0,
+      });
+      writeFileSync(info.outputPath('安装版校时与重放.json'), JSON.stringify({
+        platform: process.platform, delayMs, clockReadsBeforeUpload: 2, pauseSeconds, finishSeconds, seconds,
+        distinctReceipts: new Set(expectedIds).size, pausedMilliseconds, samePauseRequestAfterRestart: true,
+      }, null, 2) + '\n');
+    });
+    expect(readSqlite(database, 'PRAGMA quick_check')).toBe('ok');
+    expect(readSqlite(offlineDatabase, 'PRAGMA quick_check')).toBe('ok');
+  } finally {
+    if (realpathSync(folder) !== folder || dirname(folder) !== parent) throw new Error('Unexpected installed timer fixture path');
+    rmSync(folder, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  }
+});
+
+test('the installed Electron app restores archived originals and reopens their old wiki paths', async ({}, info) => {
+  test.skip(!installed, 'Set ZHIXUE_TEST_ELECTRON to run against an installed app');
+  const parent = realpathSync(tmpdir());
+  const root = realpathSync(mkdtempSync(join(parent, 'zhixue-installed-portable-trash-')));
+  const producer = join(root, 'producer');
+  const receiver = join(root, 'receiver');
+  const media = join(root, 'encrypted-archives');
+  for (const dir of [producer, receiver, media]) mkdirSync(dir);
+  const name = '换机回收验收原件.md';
+  const line = '归档保留的原文。';
+  const original = '# 换机回收验收\n\n' + line;
+  const ordinary = 'library/imports/整库恢复后找回.md';
+  const confirmed = 'library/imports/核对后找回.md';
+  type Archive = { id: string; archivePath: string; originalPath: string; revision: string };
+  let entry!: Archive;
+  let fileId!: string;
+  let source!: string;
+  let backup!: { id: string; name: string };
+  let backupDigest!: string;
+  let restoreId!: string;
+
+  async function initialize(page: Page) {
+    await page.getByRole('button', { name: '使用此位置', exact: true }).click();
+    await page.getByRole('button', { name: '稍后配置模型', exact: true }).click();
+    await expect(page.getByRole('heading', { name: home })).toBeVisible();
+  }
+
+  async function resolveWiki(page: Page, target: string) {
+    return api(page, '/files/wiki/resolve?' + new URLSearchParams({ target }));
+  }
+
+  function oldPaths() {
+    return [entry.originalPath, entry.originalPath.replace(/^library\//, '')];
+  }
+
+  async function checkPaths(page: Page, path: string, status: 'ready' | 'trashed') {
+    for (const target of oldPaths()) {
+      const answer = await resolveWiki(page, target);
+      expect(answer.state).toBe('resolved');
+      expect(answer.choices).toHaveLength(1);
+      expect(answer.choices[0]).toMatchObject({ id: fileId, path, status });
+    }
+  }
+
+  async function restoreBackup(page: Page) {
+    const route = '/backups/' + backup.id;
+    const preview = await api(page, route + '/preview', 'POST', { password });
+    expect(preview.files).toContainEqual(expect.objectContaining({ path: entry.archivePath, revision: entry.revision }));
+    expect(preview.restore.confirmation).toBeTruthy();
+    const accepted = await api(page, route + '/restore', 'POST', { password, confirmation: preview.restore.confirmation });
+    await expect.poll(async () => (await api(page, '/backups/restore-status')).state, { timeout: 35000 }).toBe('complete');
+    const result = await api(page, '/backups/restore-status');
+    expect(result.id).toBe(accepted.id);
+    expect(result.rollbackBackupId).toBeTruthy();
+    expect(readFileSync(join(receiver, entry.archivePath), 'utf8')).toBe(original);
+    restoreId = result.id;
+    return result.rollbackBackupId as string;
+  }
+
+  async function openRestore(page: Page, path: string) {
+    await page.evaluate(file => { location.hash = '#/library?' + new URLSearchParams({ file }); }, source);
+    const preview = page.locator('.library-preview');
+    await preview.getByRole('link', { name: '[[旧回收路径]]', exact: true }).click();
+    await preview.getByRole('button', { name: '查看回收站', exact: true }).click();
+    await page.locator('.trash-entry').filter({ hasText: name }).getByRole('button', { name: '恢复文件', exact: true }).click();
+    const dialog = page.getByRole('dialog', { name: '恢复文件' });
+    await dialog.getByLabel('恢复位置').fill(path);
+    return dialog;
+  }
+
+  async function checkOriginal(page: Page, path: string) {
+    const current = await api(page, '/files/' + fileId + '?' + new URLSearchParams({ at: '3', revision: entry.revision }));
+    expect(current).toMatchObject({ id: fileId, path, revision: entry.revision, anchor: { number: 3, text: line } });
+    const file = await wire(page, '/files/' + fileId + '/original');
+    expect(file.ok()).toBe(true);
+    expect(await file.body()).toEqual(Buffer.from(original, 'utf8'));
+    expect(readFileSync(join(receiver, path), 'utf8')).toBe(original);
+    expect(existsSync(join(receiver, entry.archivePath))).toBe(false);
+    await checkPaths(page, path, 'ready');
+    const backlinks = await api(page, '/files/' + fileId + '/backlinks');
+    expect(backlinks.map((ref: { id: string; at: number }) => [ref.id, ref.at])).toEqual([[source, 1], [source, 3]]);
+  }
+
+  try {
+    await withApp(producer, async page => {
+      await initialize(page);
+      fileId = (await api(page, '/files', 'POST', { name, content: original })).id;
+      const item = await api(page, '/files/' + fileId);
+      const relativePath = item.path.replace(/^library\//, '');
+      source = (await api(page, '/files', 'POST', {
+        name: '回收原件链接.md', content: '[[' + item.path + '|旧回收路径]]\n\n[[' + relativePath + ']]',
+      })).id;
+      const offer = await api(page, '/files/' + fileId + '/trash');
+      expect(offer.wikiImpact).toMatchObject({ sourceCount: 1, sources: [expect.objectContaining({ id: source, lines: 2 })] });
+      entry = await api(page, '/files/' + fileId + '/trash', 'POST', { path: item.path, revision: item.revision });
+      await api(page, '/files/reindex', 'POST');
+      await checkPaths(page, entry.originalPath, 'trashed');
+      await api(page, '/backups/destination', 'PUT', { directory: media });
+      backup = await api(page, '/backups', 'POST', { password });
+      backupDigest = digest(join(media, backup.name));
+    });
+
+    await test.step('reads archived paths after opening an encrypted backup in a fresh workspace', async () => {
+      await withApp(receiver, async page => {
+        await initialize(page);
+        const prior = await api(page, '/files', 'POST', { name: '接收库原有资料.md', content: '# 本机现有资料' });
+        const priorPath = (await api(page, '/files/' + prior.id)).path;
+        await api(page, '/backups/destination', 'PUT', { directory: media });
+        const rollback = await restoreBackup(page);
+        const preview = await api(page, '/backups/' + rollback + '/preview', 'POST', { password });
+        expect(preview.files).toContainEqual(expect.objectContaining({ path: priorPath }));
+        await checkPaths(page, entry.originalPath, 'trashed');
+        const dialog = await openRestore(page, ordinary);
+        await dialog.getByRole('button', { name: '确认恢复', exact: true }).click();
+        await expect(dialog).toBeHidden();
+        await expect(page.locator('.library-preview').getByText(ordinary, { exact: true })).toBeVisible();
+        await checkOriginal(page, ordinary);
+      });
+    });
+
+    await test.step('confirms unchanged trash bytes after a file identity change', async () => {
+      await withApp(receiver, async page => {
+        await expect(page.getByRole('heading', { name: home })).toBeVisible();
+        await restoreBackup(page);
+        const archive = realpathSync(join(receiver, entry.archivePath));
+        expect(relative(realpathSync(join(receiver, 'library', '.trash')), archive)).not.toMatch(/^\.\./);
+        const copied = join(dirname(archive), '.installer-test-copy');
+        writeFileSync(copied, readFileSync(archive), { flag: 'wx' });
+        renameSync(copied, archive);
+        const open = async () => {
+          const dialog = await openRestore(page, confirmed);
+          await dialog.getByRole('button', { name: '确认恢复', exact: true }).click();
+          await expect(dialog.getByRole('status')).toContainText('当前内容与回收记录的版本一致。');
+          return dialog;
+        };
+        const canceled = await open();
+        await canceled.screenshot({ path: info.outputPath('安装版回收原件核对.png') });
+        await canceled.getByRole('button', { name: '取消', exact: true }).click();
+        await checkPaths(page, entry.originalPath, 'trashed');
+        expect(readFileSync(archive, 'utf8')).toBe(original);
+        const dialog = await open();
+        await dialog.getByRole('button', { name: '按核对版本恢复', exact: true }).click();
+        await expect(dialog).toBeHidden();
+        await expect(page.locator('.library-preview').getByText(confirmed, { exact: true })).toBeVisible();
+        await checkOriginal(page, confirmed);
+      });
+    });
+
+    await test.step('reads the recovered bytes and both old paths after restart', async () => {
+      await withApp(receiver, async page => {
+        await expect(page.getByRole('heading', { name: home })).toBeVisible();
+        await checkOriginal(page, confirmed);
+        expect((await api(page, '/backups/restore-status')).id).toBe(restoreId);
+        expect(digest(join(media, backup.name))).toBe(backupDigest);
+        const database = join(receiver, 'zhixue.sqlite3');
+        expect(schema(database)).toBe(expectedMigrationHead());
+        expect(readSqlite(database, 'PRAGMA quick_check')).toBe('ok');
+      });
+    });
+    await info.attach('installed-trash-recovery', { contentType: 'application/json', body: JSON.stringify({
+      id: fileId, revision: entry.revision, oldPaths: oldPaths(), ordinary, confirmed, restoreId, backupDigest,
+    }, null, 2) });
+  } finally {
+    expect(dirname(realpathSync(root))).toBe(parent);
+    rmSync(root, { recursive: true });
+  }
+});
+
+test('the installed Electron app saves a returned original and reopens it after restart', async ({}, info) => {
+  test.skip(!installed, 'Set ZHIXUE_TEST_ELECTRON to run against an installed app');
+  const parent = realpathSync(tmpdir());
+  const root = realpathSync(mkdtempSync(join(parent, 'zhixue-installed-original-return-')));
+  const workspace = join(root, 'workspace');
+  mkdirSync(workspace);
+  const name = '归位验收资料.md';
+  const first = '# 归位验收\n首版原文。';
+  const returned = '# 归位验收\n在原目录外修改的原文。';
+  const line = '归位后再次保存的原文。';
+  const updated = '# 归位验收\n' + line;
+  const revision = createHash('sha256').update(updated).digest('hex');
+  let fileId!: string;
+  let originalPath!: string;
+  let physical!: string;
+  let linkSource!: string;
+
+  async function checkUpdated(page: Page) {
+    const detail = await api(page, '/files/' + fileId + '?' + new URLSearchParams({ at: '2', revision }));
+    expect(detail).toMatchObject({ id: fileId, status: 'ready', path: originalPath, revision,
+      content: updated, anchor: { number: 2, text: line } });
+    const original = await wire(page, '/files/' + fileId + '/original');
+    expect(original.ok()).toBe(true);
+    expect(await original.body()).toEqual(Buffer.from(updated, 'utf8'));
+    expect(digest(physical)).toBe(revision);
+    for (const target of [originalPath, originalPath.replace(/^library\//, '')]) {
+      const wiki = await api(page, '/files/wiki/resolve?' + new URLSearchParams({ target }));
+      expect(wiki.state).toBe('resolved');
+      expect(wiki.choices).toHaveLength(1);
+      expect(wiki.choices[0]).toMatchObject({ id: fileId, path: originalPath, status: 'ready' });
+    }
+    await page.evaluate(file => { location.hash = '#/library?' + new URLSearchParams({ file }); }, linkSource);
+    const preview = page.locator('.library-preview');
+    await preview.getByRole('link', { name: '[[原件位置]]', exact: true }).click();
+    await expect(preview).toContainText(line);
+  }
+
+  try {
+    await withApp(workspace, async page => {
+      await page.getByRole('button', { name: '使用此位置', exact: true }).click();
+      await page.getByRole('button', { name: '稍后配置模型', exact: true }).click();
+      await expect(page.getByRole('heading', { name: home })).toBeVisible();
+      expect(schema(join(workspace, 'zhixue.sqlite3'))).toBe(expectedMigrationHead());
+      await test.step('returns the original and reads it with the same file identity', async () => {
+        fileId = (await api(page, '/files', 'POST', { name, content: first })).id;
+        const stored = await api(page, '/files/' + fileId);
+        originalPath = stored.path;
+        physical = realpathSync(join(workspace, originalPath));
+        const within = relative(realpathSync(join(workspace, 'library')), physical);
+        expect(within && !isAbsolute(within) && !/^\.\.(?:[\\/]|$)/.test(within)).toBeTruthy();
+        expect(readFileSync(physical, 'utf8')).toBe(first);
+        linkSource = (await api(page, '/files', 'POST', {
+          name: '原件归位引用.md', content: '[[' + originalPath + '|原件位置]]',
+        })).id;
+        const key = statSync(physical, { bigint: true });
+        expect(key.ino).not.toBe(0n);
+        const parked = join(workspace, '移出期间.md');
+        renameSync(physical, parked);
+        expect(await api(page, '/files/' + fileId)).toMatchObject({ id: fileId, status: 'missing' });
+        writeFileSync(parked, returned);
+        renameSync(parked, physical);
+        const seen = statSync(physical, { bigint: true });
+        expect([seen.dev, seen.ino]).toEqual([key.dev, key.ino]);
+        expect(await api(page, '/files/' + fileId)).toMatchObject({
+          id: fileId, status: 'ready', path: originalPath, content: returned,
+        });
+      });
+
+      await test.step('saves a later replacement and opens it from the original link', async () => {
+        const replacement = physical + '.installer-test-write';
+        writeFileSync(replacement, updated, { flag: 'wx' });
+        renameSync(replacement, physical);
+        await checkUpdated(page);
+      });
+    });
+
+    await test.step('reopens the updated original and its old link after restart', async () => {
+      await withApp(workspace, async page => {
+        await expect(page.getByRole('heading', { name: home })).toBeVisible();
+        await checkUpdated(page);
+        expect(readSqlite(join(workspace, 'zhixue.sqlite3'), 'PRAGMA quick_check')).toBe('ok');
+        await page.locator('.library-preview').screenshot({ path: info.outputPath('安装版原件归位读回.png') });
+      });
+    });
+  } finally {
+    expect(dirname(realpathSync(root))).toBe(parent);
+    rmSync(root, { recursive: true, maxRetries: 5, retryDelay: 200 });
   }
 });

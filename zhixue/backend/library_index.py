@@ -254,7 +254,8 @@ def keyword_search(query: str, scope: dict, execute) -> dict:
         JOIN library_index_documents d ON p.file_id=d.id
         {METADATA_JOIN}
         WHERE ({matches}) AND {SEARCH_FILTERS}
-        ORDER BY CASE WHEN :shelf='recent' THEN a.last_viewed_at END DESC,
+        ORDER BY CASE WHEN :shelf='recent' THEN a.last_viewed_order END DESC,
+            CASE WHEN :shelf='recent' THEN a.last_viewed_at END DESC,
             (p.position=0) DESC, d.name, d.id, p.position LIMIT :limit
     """
     rows = list(execute(statement, params))
@@ -279,6 +280,7 @@ def document_info(row) -> dict:
         "status": row["status"], "message": row["message"],
         "pageCount": row["page_count"], "unreadablePages": json.loads(row["unreadable_pages"]),
         "tags": json.loads(row["tags"]), "favorite": bool(row["favorite"]), "lastViewedAt": row["last_viewed_at"],
+        **({"lastViewedOrder": row["last_viewed_order"]} if row["last_viewed_order"] is not None else {}),
     }
 
 

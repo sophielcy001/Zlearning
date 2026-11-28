@@ -1,6 +1,8 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
+import pytest
+
 from test_backups import accepted
 from test_course_verification import authorize, model_traffic, prepare, publish
 from test_daily_plan import confirm, preview
@@ -123,6 +125,42 @@ def test_fixed_lesson_is_independent_of_daily_reminder_and_resnoozing_requires_a
         learn(http, lesson_url)
         now += timedelta(minutes=30)
         assert check(http)["reminders"] == []
+
+
+@pytest.mark.parametrize(("other_start", "prior_action"), [(None, "dismiss"), ("19:15", "in_30_minutes")])
+def test_rebooking_a_fixed_lesson_restarts_its_reminder_without_reviving_an_old_receipt(tmp_path, other_start, prior_action):
+    now = datetime(2027, 1, 31, 10, 59)
+    with local_app(tmp_path, lambda: now) as http:
+        first_lesson(http, tmp_path)
+        plan = accepted(http.get("/api/study-plan"))
+        day = plan["today"]
+        task = plan["days"][0]["tasks"][0]
+
+        def book(start):
+            move, result = preview(http, task, day if start is not None else None, start)
+            return accepted(confirm(http, move, result))
+
+        book("19:00")
+        now += timedelta(minutes=1)
+        prior, = check(http)["reminders"]
+        action(http, prior, prior_action)
+        book("19:00")
+        assert check(http)["reminders"] == []
+
+        book(other_start)
+        book("19:00")
+        fresh, = check(http)["reminders"]
+        assert fresh["id"] != prior["id"]
+        assert (fresh["lessonId"], fresh["slotDay"], fresh["startsAt"]) == (task["lessonId"], day, "19:00")
+        stale = http.post(f"{API}/{prior['id']}/action", json={"version": prior["version"], "action": "dismiss"})
+        assert stale.status_code in (404, 409)
+        workspace = accepted(http.get("/api/mobile/catalog"))["workspace"]
+        phone = accepted(http.post("/api/mobile/reminders/check", json={"workspace": workspace, "trigger": "foreground"}))
+        assert phone["reminders"] == []
+
+    with local_app(tmp_path, lambda: now) as http:
+        assert check(http)["reminders"] == []
+        assert check(http, shown=[{"id": fresh["id"], "version": fresh["version"]}])["reminders"] == [fresh]
 
 
 def test_resolved_reviews_are_not_repeated_after_a_snooze(tmp_path):
@@ -261,3 +299,69 @@ def test_phone_does_not_consume_a_desktop_only_dispute_reminder(tmp_path):
         assert phone["reminders"] == []
         dispute, = check(http)["reminders"]
         assert dispute["reviews"] == 0 and dispute["disputes"] == 3
+
+
+def test_phone_review_delivery_does_not_claim_desktop_disputes(tmp_path):
+    calls = []
+    with session(tmp_path) as http:
+        project, _, _, payload = prepare(http, tmp_path, calls)
+        authorize(http, project, payload)
+        assert run(tmp_path, model_traffic(calls)) and publish(tmp_path)
+        review_lesson = first_lesson(http, tmp_path)
+        learn(http, review_lesson)
+        today = accepted(http.post("/api/demo/next-day"))["today"]
+        workspace = accepted(http.get("/api/mobile/catalog"))["workspace"]
+        [phone] = accepted(http.post("/api/mobile/reminders/check", json={
+            "workspace": workspace, "trigger": "foreground",
+        }))["reminders"]
+        assert phone["reviews"] == 2
+
+        assert check(http, "scheduled", day=today)["reminders"] == []
+        desktop = check(http)["reminders"]
+        assert len(desktop) == 1, "Mobile review delivery must leave desktop disputes available"
+        [dispute] = desktop
+        assert dispute["reviews"] == 0 and dispute["disputes"] == 3
+        assert phone["disputes"] == 0
+        assert dispute["id"] != phone["id"]
+        assert http.post("/api/mobile/reminders/action", json={
+            "workspace": workspace, "id": dispute["id"], "version": dispute["version"], "action": "dismiss",
+        }).status_code == 404
+        assert check(http)["reminders"] == []
+        settings(http, enabled=False)
+        assert check(http, shown=[{"id": dispute["id"], "version": dispute["version"]}])["reminders"] == []
+        settings(http)
+        action(http, dispute, "tomorrow")
+        assert check(http)["reminders"] == []
+        advanced = accepted(http.post("/api/demo/next-day"))["today"]
+        assert advanced != today
+        [phone_next] = accepted(http.post("/api/mobile/reminders/check", json={
+            "workspace": workspace, "trigger": "foreground",
+        }))["reminders"]
+        assert phone_next["id"] == phone["id"] and phone_next["version"] == phone["version"] + 1
+        [desktop_next] = check(http)["reminders"]
+        assert desktop_next["id"] == dispute["id"] and desktop_next["version"] == dispute["version"] + 1
+        assert desktop_next["disputes"] == 3
+
+
+def test_combined_reminder_requires_current_versions_and_snoozes_both_sections(tmp_path):
+    calls = []
+    with session(tmp_path) as http:
+        project, _, _, payload = prepare(http, tmp_path, calls)
+        authorize(http, project, payload)
+        assert run(tmp_path, model_traffic(calls)) and publish(tmp_path)
+        learn(http, first_lesson(http, tmp_path))
+        accepted(http.post("/api/demo/next-day"))
+        [combined] = check(http)["reminders"]
+        assert (combined["reviews"], combined["disputes"]) == (2, 3)
+        related = combined["disputeReceipt"]
+        endpoint = f"{API}/{combined['id']}/action"
+        decision = {"version": combined["version"], "action": "in_30_minutes"}
+        invalid = {**related, "version": related["version"] + 1}
+        assert http.post(endpoint, json={**decision, "disputeReceipt": invalid}).status_code == 409
+        shown = [{"id": combined["id"], "version": combined["version"]}, related]
+        assert check(http, shown=shown)["reminders"] == [combined]
+        snoozed = accepted(http.post(endpoint, json={**decision, "disputeReceipt": related}))
+        assert accepted(http.post(endpoint, json={**decision, "disputeReceipt": related})) == snoozed
+        assert check(http, shown=shown)["reminders"] == []
+        remaining = check(http)["nextCheckSeconds"]
+        assert remaining is not None and 1790 < remaining <= 1800

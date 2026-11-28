@@ -16,6 +16,8 @@ from uuid import UUID, uuid4
 
 from alembic.config import Config
 from alembic.script import ScriptDirectory
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from .backup_catalog import BackupCatalog, CatalogItem
 from .backup_format import EXTENSION, BackupError, BackupHeader, damaged
@@ -23,7 +25,10 @@ from .backup_snapshot import (
     DATABASE, VerifiedBackup, create_backup, current_view, plain, read_backup, scan_library, verified_database,
 )
 from .backup_work import backup_workspace
-from .db import ROOT, MobileWorkspace, open_db, transaction, upgrade
+from .db import ROOT, LibraryTrash, MobileWorkspace, open_db, transaction, upgrade
+from .external_memory import retain_external_memory
+from .file_locations import identity_of
+from .library_trash import archive_path
 from .model_ledger import retain_charges
 from .restored_tasks import hold_restored_tasks
 from .storage_files import sync_directory
@@ -231,6 +236,22 @@ def seal_database(database: Path) -> None:
         os.fsync(handle.fileno())
 
 
+def rebind_trash_originals(db: Session, incoming: Path, backup: VerifiedBackup) -> None:
+    revisions = {file.path: file.revision for file in backup.manifest.files if file.path.startswith("library/.trash/")}
+    if not revisions:
+        return
+    folder = incoming.resolve()
+    for entry in db.scalars(select(LibraryTrash).where(LibraryTrash.state == "trashed")):
+        path = archive_path(folder, entry)
+        # read_backup verified the extracted bytes against this manifest before the workspace can switch.
+        if revisions.get(path.relative_to(folder).as_posix()) != entry.revision:
+            continue
+        identity = identity_of(path)
+        if identity is None:
+            raise BackupError("restore_write", "已校验的回收站原件在恢复暂存目录中缺失。")
+        entry.file_key, entry.birth_time = identity.key, identity.birth
+
+
 def prepare_restored_database(incoming: Path, backup: VerifiedBackup, current_engine) -> tuple[int, int]:
     database = incoming / DATABASE
     manifest = backup.manifest
@@ -245,7 +266,9 @@ def prepare_restored_database(incoming: Path, backup: VerifiedBackup, current_en
         upgrade(stage)
         with transaction(current_engine, write=False) as current, transaction(stage) as db:
             retain_charges(current, db)
+            retain_external_memory(current, db, datetime.now(UTC).replace(tzinfo=None))
             db.get(MobileWorkspace, 1).identity = str(uuid4())
+            rebind_trash_originals(db, incoming, backup)
         held = hold_restored_tasks(stage, backup.header.created_at)
     finally:
         stage.dispose()

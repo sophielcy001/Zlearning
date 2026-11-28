@@ -7,11 +7,14 @@ import { api, type Timer, courseUrl, dateLabel } from './api';
 import { abilityName, type AssessmentDetail, type AssessmentGroup, type RemediationStatus } from './assessment-types';
 import { BackedStatus, Empty, ErrorNote, useAction, useRead } from './shared';
 import { VoiceInput } from './voice-input';
+import { studyReportUrl } from './weak-practice';
 
 const outcomes = { passed: '独立通过', failed: '需要再练习', hinted: '已完成辅助练习' };
 const remediationProgress = { drafting: '正在起草错因补学', verifying: '正在独立核验补学', publishing: '正在保存补学讲解' };
 
-function AssessmentAnswers({ value, changed }: { value: AssessmentGroup; changed: (group: AssessmentGroup) => void }) {
+function AssessmentAnswers({ value, changed, returnTo = '/reviews' }: {
+  value: AssessmentGroup; changed: (group: AssessmentGroup) => void; returnTo?: string;
+}) {
   const [answers, setAnswers] = useState(() => value.questions.map((_, index) => value.draft[index] ?? ''));
   const [hint, setHint] = useState(value.hint);
   const navigate = useNavigate();
@@ -42,7 +45,7 @@ function AssessmentAnswers({ value, changed }: { value: AssessmentGroup; changed
         onClick={() => void action.run(async () => setHint((await api<AssessmentGroup>(`${endpoint}/hint`, 'POST')).hint))}>给点提示</button>
       <button type="button" className="button secondary" disabled={action.pending} onClick={() => void action.run(async () => {
         await api(`${endpoint}/draft`, 'PUT', { answers });
-        navigate('/reviews');
+        navigate(returnTo);
       })}>稍后再答</button>
       <button type="button" className="text-action" disabled={action.pending} onClick={() => submit('unknown')}>我不会，查看讲解</button>
     </div>
@@ -64,8 +67,9 @@ function RemediationResult({ lesson, value, retry, busy }: {
   return <p className="model-help" role="status">{remediationProgress[value.state]}</p>;
 }
 
-function Report({ lesson, value, canRecheck, recheck, retryRemediation, busy }: {
+function Report({ lesson, value, canRecheck, recheck, retryRemediation, busy, focused }: {
   lesson: string; value: AssessmentGroup; canRecheck: boolean; recheck: () => void; retryRemediation: () => void; busy: boolean;
+  focused: boolean;
 }) {
   const result = value.result;
   if (!result) return null;
@@ -93,28 +97,32 @@ function Report({ lesson, value, canRecheck, recheck, retryRemediation, busy }: 
       </li>)}
     </ul></details>}
     {value.remediation && <RemediationResult lesson={lesson} value={value.remediation} retry={retryRemediation} busy={busy} />}
-    <div className="action-row">
+    {!focused && <div className="action-row">
       <Link className="button primary" to="/reviews">返回复习列表</Link>
       {canRecheck && <button type="button" className="button secondary" disabled={busy} onClick={recheck}>重新核查</button>}
-    </div>
+    </div>}
   </article>;
 }
 
 export function ModelReviewPage({ timer, onChange }: { timer: Timer | null; onChange: () => void }) {
   const { lessonId = '', key = '' } = useParams();
   const [params, setParams] = useSearchParams();
-  const selected = params.get('group');
+  const focus = params.get('focus');
+  const selected = focus ? null : params.get('group');
+  const reportQuery = selected ? params.get('returnReport') : null;
+  const fromReport = !!focus || reportQuery !== null;
+  const returnTo = fromReport ? studyReportUrl(reportQuery === null ? params : new URLSearchParams(reportQuery)) : '/reviews';
   const endpoint = `/lessons/${lessonId}/assessments/${key}`;
-  const read = useRead<AssessmentDetail>(endpoint);
+  const read = useRead<AssessmentDetail>(focus ? `${endpoint}?${new URLSearchParams({ focus })}` : endpoint);
   const active = useRead<AssessmentGroup>(selected ? `/assessments/${encodeURIComponent(selected)}` : null);
   const action = useAction();
   const detail = read.value;
   const candidate = selected ? active.value : detail?.group;
   const refreshDetail = read.refresh;
   const refreshGroup = active.refresh;
-  const supplement = candidate?.remediation?.state;
-  const running = candidate?.jobState === 'queued' || candidate?.jobState === 'running'
-    || supplement === 'drafting' || supplement === 'verifying' || supplement === 'publishing';
+  const activeSupplement = [candidate?.remediation?.state, detail?.focus?.remediation?.state]
+    .some(state => state === 'drafting' || state === 'verifying' || state === 'publishing');
+  const running = candidate?.jobState === 'queued' || candidate?.jobState === 'running' || activeSupplement;
   const state = candidate?.state;
   useEffect(() => {
     if (!running) return;
@@ -127,33 +135,47 @@ export function ModelReviewPage({ timer, onChange }: { timer: Timer | null; onCh
       onChange();
     }
   }, [selected, state, refreshDetail, onChange]);
-  if (!detail) return <section className="page"><BackedStatus error={read.error} retry={refreshDetail} /></section>;
+  const returnLink = <Link className="back" to={returnTo}><ArrowLeft size={16} />{fromReport ? '返回学习报告' : '今日复习'}</Link>;
+  if (!detail) return <section className="page narrow-page">{returnLink}<BackedStatus error={read.error} retry={refreshDetail} /></section>;
   const group = candidate;
+  const source = detail.focus;
   function changed(saved: AssessmentGroup) {
-    setParams({ group: saved.id });
+    if (!focus) setParams(reportQuery === null ? { group: saved.id } : { group: saved.id, returnReport: reportQuery });
     refreshGroup();
     refreshDetail();
     onChange();
     refreshReminders();
   }
   function prepare(mode: 'formal' | 'practice') {
-    void action.run(async () => changed(await api<AssessmentGroup>(`${endpoint}/prepare`, 'POST', { mode })));
+    void action.run(async () => changed(await api<AssessmentGroup>(`${endpoint}/prepare`, 'POST', { mode, focus: focus || undefined })));
   }
   function control(next: 'retry' | 'recheck' | 'remediation/retry') {
     if (group) void action.run(async () => changed(await api<AssessmentGroup>(`/assessments/${group.id}/${next}`, 'POST')));
   }
-  const mayWrite = group?.round === detail.round && (group?.mode === 'formal' ? detail.status === 'due'
+  function retrySourceRemediation() {
+    if (source) void action.run(async () => {
+      await api(`/assessments/${source.id}/remediation/retry`, 'POST');
+      refreshDetail();
+    });
+  }
+  const mayWrite = !detail.focusIssue && group?.round === detail.round && (group?.mode === 'formal' ? detail.status === 'due'
     : ['due', 'upcoming', 'complete'].includes(detail.status));
   return <section className="page narrow-page">
-    <Link className="back" to="/reviews"><ArrowLeft size={16} />今日复习</Link>
+    {returnLink}
     <div className="page-head"><div><h1>{detail.title}</h1>
       <p>{detail.projectTopic}{detail.ability && ` · ${abilityName[detail.ability]}`}
-        {group ? ` · ${group.mode === 'practice' ? '提前练习' : `第 ${group.round} 轮`}` : ''}</p>
+        {focus ? ' · 专项练习' : group ? ` · ${group.mode === 'practice' ? '提前练习' : `第 ${group.round} 轮`}` : ''}</p>
     </div></div>
-    <StudyTimer active={timer} lessonId={lessonId} category="review" reviewKey={key} onChange={onChange} />
+    {focus ? <p className="report-hint">专项练习单独记录。正式复习日期沿用原安排。</p>
+      : <StudyTimer active={timer} lessonId={lessonId} category="review" reviewKey={key} onChange={onChange} />}
+    {source?.result && <details className="panel feedback">
+      <summary>来源评价与讲解</summary>
+      <p>第 {source.round} 轮 · {outcomes[source.result.outcome]}</p><p>{source.result.explanation}</p>
+      {source.remediation && <RemediationResult lesson={lessonId} value={source.remediation} retry={retrySourceRemediation} busy={action.pending} />}
+    </details>}
     <ErrorNote message={action.error || read.error} retry={read.error ? refreshDetail : undefined} />
     {selected && !group ? <BackedStatus error={active.error} retry={refreshGroup} /> : group?.state === 'graded'
-      ? <Report lesson={lessonId} value={group}
+      ? <Report lesson={lessonId} value={group} focused={!!focus}
         canRecheck={group.mode === 'formal' && group.answers.some(answer => answer.trim()) && group.round + 1 === detail.round}
         recheck={() => control('recheck')} retryRemediation={() => control('remediation/retry')} busy={action.pending} />
       : group && group.state !== 'ready' ? <div className="panel assessment-status">
@@ -166,7 +188,12 @@ export function ModelReviewPage({ timer, onChange }: { timer: Timer | null; onCh
         </ol></details>}
         {group.jobState === 'blocked' && <Link className="text-action" to={courseUrl(lessonId)}>返回课程查看复习授权</Link>}
         {group.state === 'superseded' && <Link className="text-action" to={courseUrl(lessonId)}>回到课程确认新版依据</Link>}
-      </div> : group && mayWrite ? <AssessmentAnswers key={group.id} value={group} changed={changed} /> : <div className="panel assessment-status">
+      </div> : group && mayWrite ? <AssessmentAnswers key={group.id} value={group} changed={changed} returnTo={returnTo} />
+        : focus ? <div className="panel assessment-status">
+          {detail.focusIssue ? <p>{detail.focusIssue}</p>
+            : <button type="button" className="button primary" disabled={action.pending} onClick={() => prepare('practice')}>生成专项练习</button>}
+          <Link className="text-action" to={courseUrl(lessonId)}>回到课程查看复习授权</Link>
+        </div> : <div className="panel assessment-status">
         {detail.status === 'due' ? <button type="button" className="button primary" disabled={action.pending} onClick={() => prepare('formal')}>准备本轮变式题</button>
           : detail.status === 'upcoming' || detail.status === 'complete' ? <>
             <p>{detail.dueOn ? `正式复习安排在 ${dateLabel(detail.dueOn)}` : '自动复习周期已结束'}</p>

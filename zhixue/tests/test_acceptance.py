@@ -51,7 +51,14 @@ def test_recording_replay_and_report_do_not_execute_the_case_again(tmp_path):
         assert "未验证 · 重启后读回阶段与测评" in report.text
         assert "未验证 · 知识库检索定位" in report.text
         assert "未验证 · 拒绝失效原文位置" in report.text
+        assert "未验证 · 双链改名与反向定位" in report.text
+        assert "未验证 · 原件归位与再次保存" in report.text
+        assert "未验证 · 重启后原件归位读回" in report.text
+        assert "未验证 · 回收站旧路径双链" in report.text
+        assert "未验证 · 加密备份找回回收原件" in report.text
+        assert "未验证 · 核对回收原件与重启读回" in report.text
         assert "未验证 · 延迟评分与单轮待办" in report.text
+        assert "未验证 · 正式复习明细与提交日" in report.text
         assert "未验证 · 单页识别授权与范围" in report.text
         assert "未验证 · 校对冲突与索引" in report.text
         assert "未验证 · 重启恢复未发送预留" in report.text

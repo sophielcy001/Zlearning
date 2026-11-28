@@ -31,7 +31,11 @@ def fail(job, reason: str) -> None:
     job.state, job.error, job.scope, job.daily_blocked_on = "failed", reason, None, None
 
 
-def reserve_scoped(engine, table, claim_type, now: datetime):
+def main_job_connection(db, job):
+    return pinned_connection(db, "main", job.connection)
+
+
+def reserve_scoped(engine, table, claim_type, now: datetime, *, resolve_connection=main_job_connection):
     clock, day = when_utc(now), billing_day(now)
     with transaction(engine) as db:
         settings = settings_view(db)
@@ -43,7 +47,7 @@ def reserve_scoped(engine, table, claim_type, now: datetime):
         )
         pending = select(table).where(eligible).order_by(table.created_at, table.id)
         for job in db.scalars(pending):
-            model = pinned_connection(db, "main", job.connection)
+            model = resolve_connection(db, job)
             if model is None:
                 fail(job, "configuration_changed")
                 continue

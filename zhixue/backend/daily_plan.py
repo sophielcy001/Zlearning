@@ -104,20 +104,26 @@ def clock(minutes: int) -> str:
 
 
 def course_estimates(db: Session, today: date) -> dict[str, int]:
-    completed = dict(db.execute(
-        select(Lesson.id, Lesson.project_id).where(Lesson.learned_on < today, scheduled_lesson())
-    ).tuples().all())
+    completed = {lesson_id: (project_id, learned_on) for lesson_id, project_id, learned_on in db.execute(
+        select(Lesson.id, Lesson.project_id, Lesson.learned_on).where(Lesson.learned_on < today, scheduled_lesson())
+    )}
     if not completed:
         return {}
     total_by_lesson: dict[str, int] = {}
     for entry in confirmed_times(db, through=today - timedelta(days=1)):
         lesson_id = entry.timer.lesson_id
+        if lesson_id not in completed:
+            continue
+        _, learned_on = completed[lesson_id]
+        if entry.report_on is not None and entry.report_on > learned_on:
+            continue
         is_learning = entry.category == "learning" or (entry.source_on is None and entry.category == "unclassified")
-        if lesson_id in completed and is_learning and entry.seconds > 0:
+        if is_learning and entry.seconds > 0:
             total_by_lesson[lesson_id] = total_by_lesson.get(lesson_id, 0) + entry.seconds
     histories: dict[str, list[int]] = {}
     for lesson_id, seconds in total_by_lesson.items():
-        histories.setdefault(completed[lesson_id], []).append(seconds)
+        project_id, _ = completed[lesson_id]
+        histories.setdefault(project_id, []).append(seconds)
     return {pid: ceil(median(seconds) / 60) for pid, seconds in histories.items()}
 
 
@@ -134,6 +140,10 @@ def completed_minutes(db: Session, today: date, estimates: dict[str, int]) -> in
 
 def lesson_task_id(lesson_id: str) -> str:
     return f"lesson:{lesson_id}"
+
+
+def appointment_subject(lesson_id: str, slot: Slot) -> str:
+    return f"lesson:{lesson_id}:{slot.day.isoformat()}:{slot.start}"
 
 
 def review_task_id(lesson_id: str, key: str, round_number: int) -> str:

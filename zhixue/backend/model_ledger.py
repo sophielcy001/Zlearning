@@ -8,11 +8,11 @@ from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import Session, object_session
 
 from .db import (
-    AssessmentJob, ChatModelCall, ChatReply, GoalAuthoringJob, GraphRecommendation, LibraryClassification, ModelCharge,
+    AgentAuthoringJob, AssessmentJob, ChatModelCall, ChatReply, GoalAuthoringJob, GraphRecommendation, LibraryClassification, MemoryInferenceJob, ModelCharge,
     ModelConnection, ModelUse, NoteCheckBatch, NoteSuggestion, PrerequisiteCall, StageReviewCall, transaction,
 )
 from .model_costs import ModelUsage, amount_text, estimate_usage
-from .model_protocols import TextReply, Transport, call_text
+from .model_protocols import TextReply, Transport, TransportNotSent, call_text
 from .money_budget import assessment_budget_scope
 
 
@@ -25,6 +25,8 @@ CALL_SCOPES = {
     GraphRecommendation: ("graph", "id"),
     LibraryClassification: ("classification", "id"),
     GoalAuthoringJob: ("goal_authoring", "id"),
+    AgentAuthoringJob: ("agent_authoring", "id"),
+    MemoryInferenceJob: ("memory_inference", "id"),
 }
 DIRECT_CALL_SOURCES = ("probe", "recognition")
 RECIPIENT_FIELDS = ("id", "revision", "name", "provider", "model")
@@ -100,7 +102,16 @@ def save_charge_reply(engine, source: str, identity: str, status: str, usage: Mo
 
 def request_model(engine, table, identity: str, recipient, key: str | None, prompt: str, max_output: int,
                   transport: Transport, now: Callable[[], datetime]) -> TextReply:
-    reply = call_text(recipient.provider, recipient.protocol, recipient.address, recipient.model, key, prompt, max_output, transport)
+    try:
+        reply = call_text(recipient.provider, recipient.protocol, recipient.address, recipient.model, key, prompt, max_output, transport)
+    except TransportNotSent:
+        with transaction(engine) as db:
+            charge = db.get(ModelCharge, (table.__tablename__, identity))
+            if charge is not None and charge.finished_at is None:
+                charge.status = "not_sent"
+                charge.finished_at = max(utc_clock(now()), charge.started_at)
+                charge.reserved_amount = None
+        raise
     # A failure applying the response must not roll back the provider's usage.
     save_charge_reply(engine, table.__tablename__, identity, reply.status, reply.usage, now())
     return reply
@@ -153,7 +164,7 @@ def sum_usage(db: Session, *scope) -> dict:
         ModelCharge.finished_at, ModelCharge.actual_currency, ModelCharge.actual_amount, ModelCharge.estimated_amount,
         ModelCharge.pricing, ModelCharge.input_tokens, ModelCharge.output_tokens, ModelCharge.total_tokens,
         ModelCharge.thinking_tokens, ModelCharge.audio_seconds,
-    ).where(*scope))
+    ).where(ModelCharge.status != "not_sent", *scope))
     currencies = {}
     counts = dict(calls=0, inFlight=0, unknownCalls=0, reportedCalls=0)
     usage = dict(inputTokens=None, outputTokens=None, totalTokens=None, thinkingTokens=None, audioSeconds=None)
@@ -210,7 +221,7 @@ def ledger_router(engine, today: Callable[[], date]) -> APIRouter:
     @router.get("/usage")
     def usage(billingDay: date | None = None, page: int = Query(default=1, ge=1, le=2**31 - 1)):
         day = billingDay or today()
-        scope = ModelCharge.billing_day == day
+        scope = (ModelCharge.billing_day == day) & (ModelCharge.status != "not_sent")
         with transaction(engine, write=False) as db:
             summary = sum_usage(db, scope)
             total = summary["calls"]

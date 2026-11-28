@@ -18,13 +18,16 @@ from .content import lesson_course
 from .course_revision import active_revision, revision_issue
 from .course_sources import sources_current
 from .db import (
-    AssessmentJob, AssessmentPlan, ChatMessage, ChatReply, Conversation, GenerationStep, GoalAuthoringJob, GraphRecommendation, Lesson, LessonAssistantPlan, LessonConsolidation,
-    LessonConsolidationPlan, LessonQuestion, LibraryClassification, ModelStudy, Note, NoteCheckPlan, NoteSuggestion, PrerequisiteTask, Project, RemediationCard,
+    AgentAuthoringJob, AssessmentJob, AssessmentPlan, ChatMessage, ChatReply, Conversation, GenerationStep, GoalAuthoringJob, GraphRecommendation, Lesson, LessonAssistantPlan, LessonConsolidation,
+    LessonConsolidationPlan, LessonQuestion, LibraryClassification, MemoryInferenceJob, ModelStudy, Note, NoteCheckPlan, NoteSuggestion, PrerequisiteTask, Project, RemediationCard,
     StageAssessment, StageReview, Task, transaction,
 )
 from .goal_authoring import scope_is_current as goal_scope_is_current
+from .professional_agent import pinned_reply_connection
 from .lesson_answer_worker import check_scope, context_available
 from .lesson_assistant import published_version, usage as answer_usage
+from .memory_inference import checked_source as memory_source_is_current
+from .memory_inference import pinned_memory_connection
 from .model_costs import MoneyLimit
 from .model_study import ERRORS, generation_amount_issue, generation_recipient, next_generation_step, settings_view, sync_task
 from .model_study_input import Input, pinned_connection
@@ -43,9 +46,9 @@ from .study_consolidation_worker import validate_scope
 
 
 Kind = Literal["generation", "assessment", "answer", "chat", "consolidation", "prerequisite", "stage_review",
-               "graph", "classification", "goal_authoring", "note_ai", "note_check"]
+               "graph", "classification", "goal_authoring", "agent_authoring", "memory_inference", "note_ai", "note_check"]
 Job = (ModelStudy | AssessmentJob | LessonQuestion | ChatReply | LessonConsolidation | PrerequisiteTask
-       | StageReview | GraphRecommendation | LibraryClassification | GoalAuthoringJob | NoteSuggestion | NoteCheckPlan)
+       | StageReview | GraphRecommendation | LibraryClassification | GoalAuthoringJob | AgentAuthoringJob | MemoryInferenceJob | NoteSuggestion | NoteCheckPlan)
 REASON_JOBS = (ModelStudy, LessonConsolidation, PrerequisiteTask, StageReview)
 
 
@@ -116,6 +119,10 @@ class RecoveryTask:
             title = "图谱推荐" if isinstance(self.job, GraphRecommendation) else "知识库 AI 整理"
             return {"id": self.identity, "kind": self.kind, "title": title, "projectId": None,
                     "projectTopic": "知识库", "lessonId": None, "phase": None, "blockedOn": self.job.daily_blocked_on}
+        if isinstance(self.job, (AgentAuthoringJob, MemoryInferenceJob)):
+            title = "AI 记忆整理" if isinstance(self.job, MemoryInferenceJob) else "专业 Agent 草稿"
+            return {"id": self.identity, "kind": self.kind, "title": title, "projectId": None,
+                    "projectTopic": "管理中心", "lessonId": None, "phase": None, "blockedOn": self.job.daily_blocked_on}
         if isinstance(self.job, GoalAuthoringJob):
             return {"id": self.identity, "kind": self.kind, "title": "学习目标草稿", "projectId": None,
                     "projectTopic": "聊天", "lessonId": None, "phase": None,
@@ -157,7 +164,7 @@ class RecoveryTask:
             job.reason = None
             job.stopped = False
             sync_task(db, job, self.project)
-        elif isinstance(job, (GraphRecommendation, LibraryClassification, GoalAuthoringJob, NoteSuggestion)):
+        elif isinstance(job, (GraphRecommendation, LibraryClassification, GoalAuthoringJob, AgentAuthoringJob, MemoryInferenceJob, NoteSuggestion)):
             job.state, job.error = "queued", None
         else:
             job.state, job.available_at = "queued", None
@@ -298,11 +305,12 @@ def budget_tasks(db: Session, folder: Path, now: datetime, *, reminder: bool = F
     for reply in db.scalars(chat):
         if requested is not None and ("chat", reply.id) not in requested:
             continue
-        if pinned_connection(db, "main", reply.recipient) is not None:
+        if pinned_reply_connection(db, reply) is not None:
             yield RecoveryTask("chat", reply, None)
 
     for kind, model in (("graph", GraphRecommendation), ("classification", LibraryClassification),
-                        ("goal_authoring", GoalAuthoringJob)):
+                        ("goal_authoring", GoalAuthoringJob), ("agent_authoring", AgentAuthoringJob),
+                        ("memory_inference", MemoryInferenceJob)):
         recommendations = select(model).where(
             model.state == "blocked", model.error.in_(reasons),
             model.scope.is_not(None), date_filter(model.daily_blocked_on),
@@ -312,7 +320,10 @@ def budget_tasks(db: Session, folder: Path, now: datetime, *, reminder: bool = F
                 continue
             if isinstance(job, GoalAuthoringJob) and not goal_scope_is_current(db, folder, job):
                 continue
-            if pinned_connection(db, "main", job.connection) is not None:
+            if isinstance(job, MemoryInferenceJob):
+                if memory_source_is_current(db, job) and pinned_memory_connection(db, job) is not None:
+                    yield RecoveryTask(kind, job, None)
+            elif pinned_connection(db, "main", job.connection) is not None:
                 yield RecoveryTask(kind, job, None)
 
     suggestions = select(NoteSuggestion).where(

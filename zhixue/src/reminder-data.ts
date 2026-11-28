@@ -4,7 +4,7 @@ export type LessonReminder = ReminderReceipt & {
   kind: 'lesson'; title: string; projectTopic: string; lessonId: string; slotDay: string; startsAt: string;
 };
 export type Reminder = LessonReminder | ReminderReceipt & (
-  { kind: 'daily'; reviews: number; disputes: number } | { kind: 'budget'; count: number }
+  { kind: 'daily'; reviews: number; disputes: number; disputeReceipt?: ReminderReceipt } | { kind: 'budget'; count: number }
 );
 export type ReminderCheck = { day: string; reminders: Reminder[]; nextCheckSeconds: number | null };
 export type ReminderTrigger = 'foreground' | 'scheduled';

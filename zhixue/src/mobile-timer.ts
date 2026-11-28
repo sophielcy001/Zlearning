@@ -161,22 +161,34 @@ function request(value: QueuedTimerEvent, sample: Clock | undefined, reading: Ti
   };
 }
 
-export async function synchronizeTimers(workspace: string, room?: string) {
-  const original = await timerLedger();
+async function readTimerClock(workspace: string, timerId: string | undefined, room?: string) {
   const startedWall = Date.now();
   const started = performance.now();
-  const reading = await mobileRequest<TimerClock>({
-    op: 'timer-state', workspace, timerId: original.active?.workspace === workspace ? original.active.id : undefined,
-  }, room);
-  const finishedWall = Date.now();
-  const elapsed = performance.now() - started;
+  const reading = await mobileRequest<TimerClock>({ op: 'timer-state', workspace, timerId }, room);
+  const reference = { wall: Date.now(), mono: performance.now() };
+  const elapsed = reference.mono - started;
   const serverTime = Date.parse(reading.serverAt);
   if (reading.workspace !== workspace || !Number.isFinite(serverTime)) throw new Error('计时工作区已变化。');
-  const sample = elapsed <= 2000 && Math.abs((finishedWall - startedWall) - elapsed) <= 250
+  const sample = elapsed <= 2000 && Math.abs((reference.wall - startedWall) - elapsed) <= 250
     ? { offset: serverTime - (startedWall + elapsed / 2), dayShift: reading.dayShift } : undefined;
+  return { reading, reference, sample };
+}
+
+export async function synchronizeTimers(workspace: string, room?: string) {
+  const original = await timerLedger();
+  const timerId = original.active?.workspace === workspace ? original.active.id : undefined;
+  let clock = await readTimerClock(workspace, timerId, room);
+  if (!clock.sample) {
+    // Recheck the current queue because a pause may have been saved during the first read.
+    const current = await timerLedger();
+    const hasUnsentSpan = current.events.some(event => event.workspace === workspace && event.segment && !event.request);
+    const interruptedSpan = clock.reading.interruptedAt && current.active?.id === timerId && current.active?.running;
+    if (hasUnsentSpan || interruptedSpan) clock = await readTimerClock(workspace, timerId, room);
+  }
+  const { reading, reference, sample } = clock;
   await editLedger(ledger => {
     if (sample) {
-      wallReference = { wall: finishedWall, mono: started + elapsed };
+      wallReference = reference;
       ledger.clocks[workspace] = sample;
     }
     const active = ledger.active;

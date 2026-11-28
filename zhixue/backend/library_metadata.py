@@ -14,7 +14,7 @@ FileId = Annotated[str, Field(min_length=1, max_length=100)]
 MAX_SELECTION = 100
 ACTIVE = "NOT EXISTS (SELECT 1 FROM library_locations l WHERE l.id=d.id AND l.trash_id IS NOT NULL)"
 METADATA_JOIN = "LEFT JOIN library_file_activity a ON a.file_id=d.id"
-METADATA_COLUMNS = """coalesce(a.favorite, 0) AS favorite, a.last_viewed_at,
+METADATA_COLUMNS = """coalesce(a.favorite, 0) AS favorite, a.last_viewed_at, a.last_viewed_order,
     (SELECT json_group_array(json_object('key', key, 'name', name)) FROM (
         SELECT key, name FROM library_file_tags WHERE file_id=d.id ORDER BY key
     )) AS tags"""
@@ -104,8 +104,11 @@ def metadata_router(engine, index) -> APIRouter:
             if row is None or row.status == "missing":
                 raise HTTPException(404, "找不到可访问的文件。")
             time = datetime.now(UTC).isoformat(timespec="microseconds")
-            db.execute(text("""INSERT INTO library_file_activity (file_id, favorite, last_viewed_at)
-                VALUES (:id, 0, :time) ON CONFLICT(file_id) DO UPDATE SET last_viewed_at=excluded.last_viewed_at"""),
+            # The enclosing immediate transaction serializes visits across writers.
+            db.execute(text("""INSERT INTO library_file_activity (file_id, favorite, last_viewed_at, last_viewed_order)
+                VALUES (:id, 0, :time, (SELECT coalesce(max(last_viewed_order), 0) + 1 FROM library_file_activity))
+                ON CONFLICT(file_id) DO UPDATE SET
+                    last_viewed_at=excluded.last_viewed_at, last_viewed_order=excluded.last_viewed_order"""),
                 {"id": identity, "time": time})
         return {"lastViewedAt": time}
 

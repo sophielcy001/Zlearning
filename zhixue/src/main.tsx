@@ -107,6 +107,9 @@ function Application({ libraryPath }: { libraryPath?: string }) {
         <Route path="settings" element={<Management state={state} onChange={refresh} libraryPath={libraryPath} />} />
         <Route path="settings/models" element={<Management state={state} onChange={refresh} area="models" />} />
         <Route path="settings/budget" element={<Management state={state} onChange={refresh} area="budget" />} />
+        <Route path="settings/skills" element={<Management onChange={refresh} area="skills" />} />
+        <Route path="settings/agents" element={<Management onChange={refresh} area="agents" />} />
+        <Route path="settings/memory" element={<Management onChange={refresh} area="memory" />} />
         <Route path="*" element={<div className="page"><Empty title="找不到这个页面"><Link to="/">返回学习首页</Link></Empty></div>} />
       </Routes>}
       </Suspense>}

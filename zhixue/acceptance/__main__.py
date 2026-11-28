@@ -32,7 +32,8 @@ def main() -> int:
         with exclusive_lease(reports / ".acceptance-lease.sqlite3"), bind_browser_listener(args.port) as (channel, port):
             token = token_urlsafe(32)
             address = f"http://127.0.0.1:{port}/#session={token}"
-            app = create_app(RunStore(reports), token)
+            store = RunStore(reports)
+            app = create_app(store, token)
             server = uvicorn.Server(uvicorn.Config(
                 app, access_log=False, log_level="warning", loop="asyncio", http="h11", ws="none",
                 timeout_graceful_shutdown=5,
@@ -46,6 +47,7 @@ def main() -> int:
                     print(f"智学独立验收 · http://127.0.0.1:{port}/" if opened else address, flush=True)
 
             def stop_on_disconnect():
+                store.request_shutdown()
                 server.should_exit = True
 
             if args.stdio:

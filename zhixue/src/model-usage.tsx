@@ -34,7 +34,7 @@ const CALL_KINDS: Record<string, string> = {
   generation: '课程生成', assessment: '复习与错因补学', answer: '课内答疑', chat: '自由聊天',
   consolidation: '学完后的答疑整理', prerequisite: '前置知识讲解', stage_review: '阶段成果评审',
   note_ai: '笔记助手', note_check: '笔记核对', graph: '图谱推荐', classification: '知识库整理',
-  goal_authoring: '学习目标整理', probe: '连接测试',
+  goal_authoring: '学习目标整理', agent_authoring: '专业 Agent 起草', memory_inference: 'AI 记忆整理', probe: '连接测试',
   voice_transcription: '外部语音转写', page_ocr: '外部单页识别',
 };
 const PHASES: Record<string, string> = { route: '路线', draft: '草稿', revision_draft: '课程修订起草', review: '独立核验' };

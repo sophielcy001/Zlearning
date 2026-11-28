@@ -8,7 +8,7 @@ from time import sleep
 from uuid import uuid4
 
 from .budget_scenario import run_budget_scenario
-from .library_scenario import run_library_scenario
+from .library_scenario import original_return_readback, run_library_scenario, run_original_return_scenario, run_semantic_first_scenario, run_wiki_scenario, wiki_readback
 from .ocr_scenario import run_ocr_scenario
 from .product import goal_project, prepare_product, restore_backup, setup_workspace, start_product, until
 from .restart_scenario import run_restart_scenario
@@ -16,6 +16,7 @@ from .revision_scenario import run_revision_scenario
 from .route_scenario import run_route_scenario
 from .simulation import ADDITION, ANSWER, BODY, MAIN, PRIVATE_LINE, QUESTION, REVIEWER, SOURCE, local_models
 from .steps import check
+from .trash_scenario import run_trash_scenario
 
 
 TOPIC = "活字印刷试印"
@@ -158,6 +159,11 @@ def study_course(run, api, models, target):
     return learned
 
 
+def formal_review_details(api, day):
+    report = api.get(f"/api/study-report?period=day&on={day}")
+    return report["totals"]["review"], report["reviewRecords"]
+
+
 def review_course(run, api, models, target, learned):
     lesson_id = target.rsplit("/", 1)[1]
 
@@ -190,6 +196,7 @@ def review_course(run, api, models, target, learned):
             waiting = scheduled(due["key"])
             check(len(waiting) == 1 and waiting[0]["status"] == "waiting" and waiting[0]["dueOn"] == initial
                   and not planned_review(due["key"]), "评分等待期间重复生成了待办或改变了首次到期日。")
+            awaiting_report = formal_review_details(api, submitted)
             for _ in range(3):
                 returned_on = api.post("/api/demo/next-day")["today"]
 
@@ -219,7 +226,25 @@ def review_course(run, api, models, target, learned):
               "迟到的评价未按实际提交日结算，或当前待办缺少评分延迟标记。")
         output.update({"评分延迟": True, "实际提交日": submitted, "实际评分日": returned_on, "真实到期日": expected,
                        "当前待办数量": len(queue), "学习计划待办数量": len(planned), "作答仍可读": True})
-    return path, result, f"{target}/assessments/{due['key']}"
+    with run.step("schedule-report", {"实际提交日": submitted, "实际评分日": returned_on}) as output:
+        graded_report = formal_review_details(api, submitted)
+        pending_counts, pending_rows = awaiting_report
+        graded_counts, graded_rows = graded_report
+        check(pending_counts == {"passed": 0, "hinted": 0, "failed": 0, "ungraded": 1} and len(pending_rows) == 1
+              and pending_rows[0]["outcome"] == "ungraded", "等待评分时，原提交日没有一条待评价的正式复习明细。")
+        pending = pending_rows[0]
+        check(pending["on"] == submitted and pending["lessonId"] == lesson_id and pending["key"] == due["key"]
+              and pending["round"] == 1 and pending["groupId"] == group["id"] and bool(pending["title"]),
+              "正式复习明细没有保留目标、首轮、题组或实际提交日。")
+        check(graded_counts == {"passed": 1, "hinted": 0, "failed": 0, "ungraded": 0}
+              and graded_rows == [{**pending, "outcome": "passed"}],
+              "评价返回后未用同一条明细更新原提交日的结算。")
+        scored_counts, scored_rows = formal_review_details(api, returned_on)
+        check(not scored_rows and not any(scored_counts.values()), "评分日重复计入了原提交日的正式复习。")
+        output.update({"实际提交日": submitted, "实际评分日": returned_on, "正式复习目标": pending["title"],
+                       "轮次": pending["round"], "评分前状态": pending["outcome"],
+                       "评分后状态": graded_rows[0]["outcome"], "评分日正式复习数": len(scored_rows)})
+    return path, result, f"{target}/assessments/{due['key']}", graded_report
 
 
 def recover_files(run, api, folder, target):
@@ -327,11 +352,14 @@ def execute(run):
                 check(not api.get("/api/state")["recentProjects"], "验收工作区包含已有项目。")
                 output.update({"正式入口": "backend.launch", "运行文件": "本机临时副本", "数据库": "新建 SQLite", "模型角色": [MAIN, REVIEWER]})
             run_library_scenario(run, api, folder)
+            run_semantic_first_scenario(run, runtime, Path(scratch) / "semantic-workspace")
+            wiki_target, wiki_source, wiki_evidence = run_wiki_scenario(run, api, folder)
+            returned_id, returned_path, returned_source, returned_evidence = run_original_return_scenario(run, api, folder)
             run_ocr_scenario(run, api, models, address)
             project, target = learning_route(run, api)
             reference = verify_course(run, api, models, project, target)
             learned = study_course(run, api, models, target)
-            review, result, objective = review_course(run, api, models, target, learned)
+            review, result, objective, review_report = review_course(run, api, models, target, learned)
 
             def reopen():
                 sessions.close()
@@ -348,16 +376,31 @@ def execute(run):
                            and item["key"] == objective.rsplit("/", 1)[1]]
                 check(len(pending) == 1 and pending[0]["dueOn"] == result["dueOn"]
                       and pending[0].get("gradingDelayed"), "重启后延迟待办或真实到期日丢失。")
+                check(formal_review_details(api, result["submittedOn"]) == review_report,
+                      "重启后原提交日的正式复习报告发生变化。")
+                check(wiki_readback(api, wiki_target, wiki_source) == wiki_evidence,
+                      "重启后双链目标或反向原文位置发生变化。")
                 database = folder / "zhixue.sqlite3"
                 check(database.is_file(), "重启后找不到隔离数据库。")
                 with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as db:
                     check(db.execute("PRAGMA integrity_check").fetchone() == ("ok",), "重启后数据库完整性检查失败。")
                 output.update({"课程版本": course["courseVersion"], "笔记": course["note"],
-                               "下次复习": result["dueOn"], "SQLite 完整性": "ok"})
+                               "下次复习": result["dueOn"], "正式复习报告读回一致": True,
+                               "双链与反向原文读回一致": True, "SQLite 完整性": "ok"})
+            with run.step("library-original-restart", {"操作": "用重启后的正式服务读回原件"}) as output:
+                found = original_return_readback(api, folder, returned_id, returned_path, returned_source)
+                check(found == returned_evidence, "重启后原件、摘要或双链发生变化。")
+                with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as db:
+                    location = db.execute("SELECT path, revision, missing FROM library_locations WHERE id=?",
+                                          (returned_id,)).fetchone()
+                    check(location == (returned_path, found["文件 SHA-256"], 0), "重启后原件的知识库登记有误。")
+                    check(db.execute("PRAGMA quick_check").fetchone() == ("ok",), "重启后数据库快检失败。")
+                output.update({"重启后原文与双链一致": True, "SQLite 完整性": "ok", **found})
             merged = recover_files(run, api, folder, target)
             retry_and_delete(run, api, models)
             recovery_backup(run, api, folder, reference, target, merged)
             run_revision_scenario(run, api, models, folder, project, target, reference, review, result, objective, ANSWERS, reopen)
+        run_trash_scenario(run, runtime, Path(scratch))
         run_budget_scenario(run, runtime, Path(scratch) / "budget-workspace")
         run_route_scenario(run, runtime, Path(scratch) / "route-workspace")
         run_restart_scenario(run, runtime, Path(scratch))

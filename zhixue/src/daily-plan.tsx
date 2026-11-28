@@ -1,14 +1,14 @@
 import { useEffect, useState, type DragEvent, type FormEvent } from 'react';
 import { ArrowRight, CalendarClock, Clock3, GripVertical, LockKeyhole, Plus, SlidersHorizontal, X } from 'lucide-react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { api, courseUrl, dateLabel, reviewUrl } from './api';
 import { refreshReminders } from './reminders';
 import { BackedStatus, ErrorNote, Modal, useAction, useRead } from './shared';
-import { dayLabel, MoveEditor, PLAN, suggestedStart, WEEKDAYS, type MoveDraft, type MoveTask, type Slot, type TimeWindow } from './study-plan-move';
+import { dayLabel, LOCK_STATUS, MoveEditor, PLAN, suggestedStart, WEEKDAYS, type LockStatus, type MoveDraft, type MoveTask, type Slot, type TimeWindow } from './study-plan-move';
 
 type StudyTask = MoveTask & Slot & { lessonId: string; estimateSource: 'timer' | 'default' }
   & ({ kind: 'lesson' } | { kind: 'review'; reviewKind: 'local' | 'model'; key: string; dueOn: string; weak: boolean });
-type PendingLock = MoveTask & Slot & { status: keyof typeof LOCK_STATUS };
+type PendingLock = MoveTask & Slot & { status: LockStatus };
 type UnplannedTask = MoveTask & { earliest: string };
 type Day = {
   date: string; windows: TimeWindow[]; override: boolean; tasks: StudyTask[];
@@ -23,14 +23,6 @@ type Plan = {
 type SourceUpdateTask = { lessonId: string; title: string; projectTopic: string; sectionCount: number };
 
 const DRAG_TASK = 'application/x-zhixue-study-task';
-const LOCK_STATUS = {
-  future: '已排在未来日期',
-  missed: '已过计划日期',
-  paused: '项目已暂停',
-  before_due: '原到期日已变化',
-  unavailable: '暂不可安排',
-  outside_hours: '时段需调整',
-};
 const START_PATTERN = '(?:[01][0-9]|2[0-3]):[0-5][0-9]';
 const END_PATTERN = `(?:${START_PATTERN}|24:00)`;
 
@@ -174,7 +166,10 @@ function TimeEditor({ weekly, day, close, onSaved }: {
 }
 
 export function DailyPlan({ working }: { working: boolean }) {
+  const [params, setParams] = useSearchParams();
+  const lockId = params.get('lock');
   const { value, error, refresh } = useRead<Plan>(PLAN);
+  const focusedLock = lockId && value?.pendingLocks.some(task => task.id === lockId) ? lockId : null;
   const { value: sourceUpdates, error: sourceError, refresh: refreshSources } = useRead<SourceUpdateTask[]>(PLAN + '/source-updates');
   const [view, setView] = useState<'week' | 'day'>('week');
   const [selectedDate, setSelectedDate] = useState<string>();
@@ -221,6 +216,13 @@ export function DailyPlan({ working }: { working: boolean }) {
     };
   }, [refreshSources]);
 
+  useEffect(() => {
+    if (!focusedLock) return;
+    const row = document.getElementById('study-lock-' + focusedLock);
+    row?.focus({ preventScroll: true });
+    row?.scrollIntoView({ block: 'center' });
+  }, [focusedLock]);
+
   const selected = value?.days.find(day => day.date === selectedDate) ?? value?.days[0];
   return <section className="page study-plan">
     <div className="page-head"><div><h1>今日任务</h1><p>按共用时间预算安排新课和到期复习。</p></div>
@@ -242,6 +244,7 @@ export function DailyPlan({ working }: { working: boolean }) {
       </div>
       {!value.configured && <p className="study-plan-note"><Clock3 size={16} /> 当前使用默认时段，每天 19:00–19:30。</p>}
       {saved && <p className="notice success" role="status">{saved}</p>}
+      {lockId && !focusedLock && <p className="study-plan-note" role="status">此预约当前不在待处理的锁定任务中。</p>}
       {value.courseUpdates.length > 0 && <section className="panel study-extra">
         <h2>待查看课程更新</h2>
         <ul>{value.courseUpdates.map(update => <li key={update.id}>
@@ -270,7 +273,7 @@ export function DailyPlan({ working }: { working: boolean }) {
           let date = task.date > value.today ? task.date : value.today;
           if (task.dueOn && task.dueOn > date) date = task.dueOn;
           const target = { date, start: task.start };
-          return <li key={task.id}>
+          return <li key={task.id} id={'study-lock-' + task.id} tabIndex={-1}>
             <div><strong>{task.title}</strong><p>{task.projectTopic} · {dayLabel(task.date)} · {task.start}–{task.end}</p>
               <LockTag /> <small>{LOCK_STATUS[task.status]}</small></div>
             <div className="study-task-actions">
@@ -303,6 +306,7 @@ export function DailyPlan({ working }: { working: boolean }) {
         close={() => setMove(undefined)} onSaved={() => {
           setMove(undefined);
           setSaved(move.release ? '已解除锁定。' : '排期已保存并锁定。');
+          if (lockId === move.task.id) setParams({}, { replace: true });
           refresh();
           refreshReminders();
         }} />}

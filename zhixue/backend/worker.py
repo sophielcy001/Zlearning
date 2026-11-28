@@ -1,6 +1,7 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from functools import partial
 from datetime import UTC, datetime
 from errno import EINVAL, ENOTSUP
 from hashlib import sha256
@@ -19,13 +20,20 @@ from .assessment_worker import (
 )
 from .backup_automatic import CHECK_INTERVAL, AutomaticBackups
 from .backup_catalog import BackupCatalog
+from .agent_authoring import (
+    AgentAuthoringClaim, complete_agent_authoring, dispatch_agent_authoring, reserve_agent_authoring, settle_agent_authoring,
+)
+from .memory_inference import (
+    MemoryInferenceClaim, complete_memory_inference, dispatch_memory_inference, reserve_memory_inference, settle_memory_inference,
+)
 from .chat_model_worker import ChatReplyClaim, complete_reply, dispatch_reply, reserve_reply, settle_interrupted_replies
 from .content import is_practice, lesson_course
 from .course_publication import publish_one
 from .db import (
-    ChatModelCall, GoalAuthoringJob, GraphRecommendation, Lesson, LibraryClassification, ModelStudy, ModelUse,
+    AgentAuthoringJob, ChatModelCall, GoalAuthoringJob, GraphRecommendation, Lesson, LibraryClassification, MemoryInferenceJob, ModelStudy, ModelUse,
     NoteCheckBatch, NoteSuggestion, PrerequisiteCall, Project, StageReviewCall, Task, open_db, transaction,
 )
+from .external_memory import ExternalMemoryCredentials, settle as settle_external_memory, step as sync_external_memory
 from .file_locations import InvalidLocation, LocationConflict, LocationTracker, checked_path, identity_of
 from .library import atomic_write, local_path
 from .library_folders import rename_without_replacing
@@ -39,10 +47,11 @@ from .library_classification_worker import (
     ClassificationClaim, complete_classification, dispatch_classification, reserve_classification, settle_classifications,
 )
 from .library_semantic import SemanticIndex
+from .semantic_model import prepare_windows_semantic_runtime
 from .lesson_answer_worker import AnswerClaim, complete_answer, dispatch_answer, reserve_answer, settle_interrupted_answers
 from .model_credentials import CredentialStore
 from .model_ledger import settle_open_charges
-from .model_protocols import Transport, post_json
+from .model_protocols import Transport, TransportNotSent, post_json
 from .model_study import Claim as GenerationClaim, complete_call, dispatch, reserve_call, settle_interrupted, utc_now, when_utc
 from .model_study_input import MAX_WORKERS
 from .note_ai_worker import NoteAIClaim, complete_note_ai, dispatch_note_ai, reserve_note_ai, settle_interrupted_note_ai
@@ -165,6 +174,13 @@ def prepare_one(folder: Path) -> bool:
         engine.dispose()
 
 
+def dispatch_claim(send, finish, engine, claim, vault, transport):
+    try:
+        send(engine, claim, vault=vault, transport=transport)
+    except TransportNotSent:
+        finish(engine, claim, "dispatch_failed", None, None, utc_now(), sent=False)
+
+
 def run_queue(
     engine: Engine, folder: Path, stopped: Event, *, vault: CredentialStore | None = None, transport: Transport = post_json,
 ) -> None:
@@ -184,6 +200,9 @@ def run_queue(
         settle_interrupted_answers(engine, utc_now())
         settle_interrupted_replies(engine, utc_now())
         settle_goal_authoring(engine, utc_now())
+        settle_agent_authoring(engine, utc_now())
+        settle_memory_inference(engine, utc_now())
+        settle_external_memory(engine)
         settle_interrupted_note_ai(engine, utc_now())
         settle_note_checks(engine, utc_now())
         settle_recommendations(engine, utc_now())
@@ -197,8 +216,10 @@ def run_queue(
         semantic = SemanticIndex(folder)
         handlers = {
             AnswerClaim: (dispatch_answer, complete_answer, ModelUse),
-            ChatReplyClaim: (dispatch_reply, complete_reply, ChatModelCall),
+            ChatReplyClaim: (partial(dispatch_reply, workspace=folder), complete_reply, ChatModelCall),
             GoalAuthoringClaim: (dispatch_goal_authoring, complete_goal_authoring, GoalAuthoringJob),
+            AgentAuthoringClaim: (dispatch_agent_authoring, complete_agent_authoring, AgentAuthoringJob),
+            MemoryInferenceClaim: (dispatch_memory_inference, complete_memory_inference, MemoryInferenceJob),
             NoteAIClaim: (dispatch_note_ai, complete_note_ai, NoteSuggestion),
             RecommendationClaim: (dispatch_recommendation, complete_recommendation, GraphRecommendation),
             ClassificationClaim: (dispatch_classification, complete_classification, LibraryClassification),
@@ -209,8 +230,11 @@ def run_queue(
             AssessmentClaim: (dispatch_assessment, complete_assessment, ModelUse),
             GenerationClaim: (dispatch, complete_call, ModelUse),
         }
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS + 2) as pool:
+        external_vault = ExternalMemoryCredentials()
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS + 3) as pool:
             flights = {}
+            external_sync = None
+            next_external_sync = 0.0
             backup_check = None
             next_backup_check = 0.0
             next_note_scan = 0.0
@@ -218,6 +242,11 @@ def run_queue(
             semantic_check = None
             while not stopped.is_set():
                 instant = monotonic()
+                if instant >= next_external_sync and (external_sync is None or external_sync.done()):
+                    if external_sync is not None and external_sync.exception() is not None:
+                        settle_external_memory(engine)
+                    external_sync = pool.submit(sync_external_memory, engine, external_vault)
+                    next_external_sync = instant + 2
                 if instant >= next_semantic_check and (semantic_check is None or semantic_check.done()):
                     working = semantic_check is not None and semantic_check.result()
                     semantic_check = pool.submit(semantic.step, stopped)
@@ -250,7 +279,8 @@ def run_queue(
                 claim = None
                 if len(flights) < MAX_WORKERS:
                     claim = (reserve_answer(engine, clock) or reserve_reply(engine, clock)
-                             or reserve_goal_authoring(engine, clock) or reserve_note_ai(engine, clock)
+                             or reserve_goal_authoring(engine, clock) or reserve_agent_authoring(engine, clock)
+                             or reserve_memory_inference(engine, clock) or reserve_note_ai(engine, clock)
                              or reserve_prerequisite(engine, clock)
                              or reserve_assessment(engine, clock, remediation_jobs=False)
                              or reserve_stage_review(engine, clock) or reserve_call(engine, clock) or reserve_assessment(engine, clock, remediation_jobs=True)
@@ -258,8 +288,8 @@ def run_queue(
                              or reserve_classification(engine, clock)
                              or reserve_note_check(engine, clock))
                 if claim:
-                    send, _, _ = handlers[type(claim)]
-                    flights[pool.submit(send, engine, claim, vault=vault, transport=transport)] = claim
+                    send, finish, _ = handlers[type(claim)]
+                    flights[pool.submit(dispatch_claim, send, finish, engine, claim, vault, transport)] = claim
                 elif not run_one(engine, folder):
                     stopped.wait(0.35)
 
@@ -269,6 +299,7 @@ def main(arguments: list[str] | None = None) -> None:
     parser.add_argument("folder", type=Path)
     args = parser.parse_args(arguments)
     folder = args.folder.resolve()
+    prepare_windows_semantic_runtime()
     engine = open_db(folder)
     stopped = Event()
 

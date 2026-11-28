@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from datetime import date
+from datetime import UTC, date, datetime
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -18,7 +18,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from .db import ImportedFile, LibraryLocation, LibraryOcrPage, LibraryWebSnapshot, transaction
+from .db import ImportedFile, LibraryLocation, LibraryOcrPage, LibraryOcrVersion, LibraryWebSnapshot, transaction
 from .recognition import Recognition
 from .documents import FORMATS, MAX_DOCUMENT_BYTES, MAX_OCR_TEXT, MAX_TEXT_BYTES, RASTER_FORMATS, TEXT_FORMATS, run_parser
 from .file_locations import InvalidLocation, LocationConflict, LocationTracker, checked_path, identity_of
@@ -30,6 +30,7 @@ from .library_metadata import Shelf, metadata_router, tag_key
 from .library_semantic import INDEX_ERROR, SemanticIndex
 from .library_trash import file_tombstone
 from .library_trash_api import trash_router
+from .notes import diff_lines
 from .web_fetch import MAX_URL_LENGTH, Snapshot, WebPageError, download_page
 from .wiki_links import MAX_WIKI_LENGTH, backlinks, resolve, suggest
 
@@ -86,8 +87,11 @@ class ExternalOcrDraft(OcrDraft):
     authorizationId: UUID
 
 
-class OcrConfirmation(OcrDraft):
+class OcrBase(OcrDraft):
     textRevision: str | None = Field(pattern="^[0-9a-f]{64}$")
+
+
+class OcrConfirmation(OcrBase):
     text: str = Field(min_length=1, max_length=MAX_OCR_TEXT)
 
     @field_validator("text")
@@ -145,8 +149,22 @@ def find_duplicate(db: Session, folder: Path, suffix: str, content: bytes, revis
     return None
 
 
+def ocr_version_data(source: str, revision: str, saved: datetime | None) -> dict:
+    return {"sourceRevision": source, "textRevision": revision,
+            "savedAt": saved.replace(tzinfo=UTC).isoformat() if saved is not None else None}
+
+
+def remember_ocr(db: Session, identity: str, number: int, revision: str,
+                 source: str, body: str, saved_at: datetime | None = None):
+    key = (identity, number, revision)
+    if db.get(LibraryOcrVersion, key) is None:
+        db.add(LibraryOcrVersion(file_id=identity, page=number, text_revision=revision,
+                                 source_revision=source, body=body, saved_at=saved_at))
+
+
 def library_router(
     engine: Engine, folder: Path, day: Callable[[Session], date], index: LibraryIndex, recognition: Recognition,
+    now: Callable[[], datetime],
 ) -> APIRouter:
     router = APIRouter(prefix="/api/files")
     folder = folder.resolve()
@@ -357,7 +375,7 @@ def library_router(
     def confirm_repair(identity: str, payload: RepairConfirmation):
         return apply_repair(identity, payload, payload.revision)
 
-    router.include_router(trash_router(engine, folder))
+    router.include_router(trash_router(engine, folder, index))
     router.include_router(folders_router(engine, folder, index))
     router.include_router(metadata_router(engine, index))
     router.include_router(batch_router(engine, folder, index, day))
@@ -434,12 +452,25 @@ def library_router(
         return Response(snapshot.content, media_type="application/octet-stream",
                         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{name}"})
 
-    def page_source(identity: str, number: int, revision: str | None):
+    def raster_info(identity: str, revision: str | None):
         info, _ = find(identity, with_passages=False)
         validate_revision(info, revision)
-        if info["format"] not in RASTER_FORMATS or not 1 <= number <= (info["pageCount"] or 0):
+        if info["format"] not in RASTER_FORMATS or not info["pageCount"]:
+            raise HTTPException(404, "找不到这一页。")
+        return info
+
+    def page_source(identity: str, number: int, revision: str | None):
+        info = raster_info(identity, revision)
+        if not 1 <= number <= info["pageCount"]:
             raise HTTPException(404, "找不到这一页。")
         return info, read_current(folder, info)
+
+    def history_page_count(identity: str, number: int, revision: str) -> int:
+        if number < 1:
+            raise HTTPException(404, "找不到这一页。")
+        info = raster_info(identity, revision)
+        read_current(folder, info)
+        return info["pageCount"]
 
     @router.get("/{identity}/pages/{number}/image")
     def page_image(identity: str, number: int, revision: str | None = Query(default=None, max_length=64)):
@@ -477,10 +508,9 @@ def library_router(
         result = recognition.ocr(str(payload.authorizationId), image)
         return {"text": result.text[:MAX_OCR_TEXT], "truncated": result.truncated or len(result.text) > MAX_OCR_TEXT}
 
-    @router.put("/{identity}/pages/{number}/ocr")
-    def confirm_ocr(identity: str, number: int, payload: OcrConfirmation):
+    def save_ocr(identity: str, number: int, payload: OcrBase, body: str):
         info, snapshot = page_source(identity, number, payload.revision)
-        text_revision = sha256(f"{payload.revision}\0{number}\0{payload.text}".encode()).hexdigest()
+        text_revision = sha256(f"{payload.revision}\0{number}\0{body}".encode()).hexdigest()
         with transaction(engine) as db:
             location = db.get(LibraryLocation, identity)
             if (location is None or location.trash_id or location.missing
@@ -499,12 +529,71 @@ def library_router(
                 return {"textRevision": text_revision}
             if previous != payload.textRevision:
                 raise HTTPException(409, "识别文本已在其他窗口保存，请刷新后重新校对。")
+            if page is not None:
+                remember_ocr(db, identity, number, page.text_revision, page.revision, page.body)
+            remember_ocr(db, identity, number, text_revision, payload.revision, body, now())
             if page is None:
                 page = LibraryOcrPage(file_id=identity, page=number)
                 db.add(page)
-            page.revision, page.text_revision, page.body = payload.revision, text_revision, payload.text
+            page.revision, page.text_revision, page.body = payload.revision, text_revision, body
             db.execute(text("UPDATE library_index_documents SET fingerprint='' WHERE id=:id"), {"id": identity})
         index.refresh(identity=identity)
         return {"textRevision": text_revision}
+
+    @router.put("/{identity}/pages/{number}/ocr")
+    def confirm_ocr(identity: str, number: int, payload: OcrConfirmation):
+        return save_ocr(identity, number, payload, payload.text)
+
+    @router.get("/{identity}/pages/{number}/ocr/versions")
+    def ocr_versions(identity: str, number: int, revision: str = Query(pattern="^[0-9a-f]{64}$"), includePages: bool = False):
+        count = history_page_count(identity, number, revision)
+        with transaction(engine, write=False) as db:
+            versions = [ocr_version_data(*row) for row in db.execute(
+                select(LibraryOcrVersion.source_revision, LibraryOcrVersion.text_revision, LibraryOcrVersion.saved_at)
+                .where(LibraryOcrVersion.file_id == identity, LibraryOcrVersion.page == number)
+                .order_by(LibraryOcrVersion.saved_at.desc(), LibraryOcrVersion.text_revision)
+            )]
+            page = db.get(LibraryOcrPage, (identity, number))
+            if page is not None and all(item["textRevision"] != page.text_revision for item in versions):
+                versions.append(ocr_version_data(page.revision, page.text_revision, None))
+            if number > count and not versions:
+                raise HTTPException(404, "找不到这一页的校对历史。")
+            current = page.text_revision if number <= count and page is not None and page.revision == revision else None
+            result = {"currentTextRevision": current, "versions": versions}
+            if includePages:
+                archived = select(LibraryOcrVersion.page).where(LibraryOcrVersion.file_id == identity)
+                existing = select(LibraryOcrPage.page).where(LibraryOcrPage.file_id == identity)
+                result.update(pageCount=count, pages=list(db.scalars(archived.union(existing).order_by("page"))))
+            return result
+
+    @router.get("/{identity}/pages/{number}/ocr/versions/{text_revision}")
+    def inspect_ocr_version(identity: str, number: int, text_revision: str, revision: str = Query(pattern="^[0-9a-f]{64}$")):
+        count = history_page_count(identity, number, revision)
+        with transaction(engine, write=False) as db:
+            row = db.get(LibraryOcrVersion, (identity, number, text_revision))
+            page = db.get(LibraryOcrPage, (identity, number))
+            if row is not None:
+                selected = {**ocr_version_data(row.source_revision, row.text_revision, row.saved_at), "text": row.body}
+            elif page is not None and page.text_revision == text_revision:
+                selected = {**ocr_version_data(page.revision, page.text_revision, None), "text": page.body}
+            else:
+                raise HTTPException(404, "找不到所选校对版本。")
+            current = {"textRevision": page.text_revision, "text": page.body} if number <= count and page and page.revision == revision else None
+            can_restore = (number <= count and selected["sourceRevision"] == revision
+                           and (not current or current["textRevision"] != text_revision))
+            return {"selected": selected, "current": current,
+                    "diff": diff_lines({"content": current["text"]} if current else None, {"content": selected["text"]}),
+                    "canRestore": can_restore}
+
+    @router.post("/{identity}/pages/{number}/ocr/versions/{text_revision}/restore")
+    def restore_ocr_version(identity: str, number: int, text_revision: str, payload: OcrBase):
+        with transaction(engine, write=False) as db:
+            row = db.get(LibraryOcrVersion, (identity, number, text_revision))
+            if row is None:
+                raise HTTPException(404, "找不到所选校对版本。")
+            if row.source_revision != payload.revision:
+                raise HTTPException(409, "这个校对版本对应旧原件，只供查阅。")
+            body = row.body
+        return save_ocr(identity, number, payload, body)
 
     return router

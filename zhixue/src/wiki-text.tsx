@@ -1,5 +1,5 @@
 import { Fragment, useMemo } from 'react';
-import { Link } from 'react-router-dom';
+import { LibraryContextLink } from './library-views';
 import { wikiReferences, wikiRoute } from './wiki-markdown';
 
 export function WikiText({ text, highlight }: { text: string; highlight?: { start: number; end: number } }) {
@@ -23,6 +23,6 @@ export function WikiText({ text, highlight }: { text: string; highlight?: { star
   return <>{links.map(({ start, end, target }) => {
     const textBefore = passage(tail, start);
     tail = end;
-    return <Fragment key={start}>{textBefore}<Link to={wikiRoute(target)}>{passage(start, end)}</Link></Fragment>;
+    return <Fragment key={start}>{textBefore}<LibraryContextLink to={wikiRoute(target)}>{passage(start, end)}</LibraryContextLink></Fragment>;
   })}{passage(tail, text.length)}</>;
 }

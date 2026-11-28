@@ -295,6 +295,67 @@ fn quit_when_ready(app: AppHandle) {
     });
 }
 
+#[cfg(windows)]
+fn install_webview_quit_shortcut(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    use webview2_com::{
+        AcceleratorKeyPressedEventHandler,
+        Microsoft::Web::WebView2::Win32::{
+            COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN, COREWEBVIEW2_PHYSICAL_KEY_STATUS,
+        },
+    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyState, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+    };
+
+    fn pressed(key: VIRTUAL_KEY) -> bool {
+        unsafe { GetKeyState(i32::from(key.0)) < 0 }
+    }
+
+    let app = window.app_handle().clone();
+    window.with_webview(move |webview| {
+        let handler = AcceleratorKeyPressedEventHandler::create(Box::new(move |_, args| {
+            let Some(args) = args else {
+                return Ok(());
+            };
+            unsafe {
+                let mut kind = Default::default();
+                args.KeyEventKind(&mut kind)?;
+                if kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN {
+                    return Ok(());
+                }
+                let mut key = 0;
+                args.VirtualKey(&mut key)?;
+                if key != u32::from(b'Q')
+                    || !pressed(VK_CONTROL)
+                    || !pressed(VK_SHIFT)
+                    || pressed(VK_MENU)
+                    || pressed(VK_LWIN)
+                    || pressed(VK_RWIN)
+                {
+                    return Ok(());
+                }
+                let mut status = COREWEBVIEW2_PHYSICAL_KEY_STATUS::default();
+                args.PhysicalKeyStatus(&mut status)?;
+                args.SetHandled(true)?;
+                if !status.WasKeyDown.as_bool() {
+                    quit_when_ready(app.clone());
+                }
+            }
+            Ok(())
+        }));
+        // The main WebView controller owns this handler for its lifetime.
+        let mut token = 0;
+        let installed = unsafe {
+            webview
+                .controller()
+                .add_AcceleratorKeyPressed(&handler, &mut token)
+        };
+        if let Err(error) = installed {
+            eprintln!("Could not register the WebView exit shortcut: {error}");
+        }
+    })
+}
+
 fn main() -> tauri::Result<()> {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
@@ -316,7 +377,7 @@ fn main() -> tauri::Result<()> {
             let window_menu = Menu::with_items(app, &[&application])?;
             #[cfg(target_os = "macos")]
             app.set_menu(window_menu.clone())?;
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::External(address))
+            let _window = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(address))
                 .title("智学 · Tauri")
                 .inner_size(1250.0, 880.0)
                 .min_inner_size(720.0, 540.0)
@@ -331,6 +392,9 @@ fn main() -> tauri::Result<()> {
                     NewWindowResponse::Deny
                 })
                 .build()?;
+
+            #[cfg(windows)]
+            install_webview_quit_shortcut(&_window)?;
 
             let show = MenuItem::with_id(app, "show", "打开智学", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "完全退出", true, None::<&str>)?;

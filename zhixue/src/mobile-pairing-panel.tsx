@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from './api';
 import { preparePair } from './mobile-pairing';
-import { browserPushSubscription } from './mobile-push';
+import { browserPushSubscription, dismissPhoneReminders } from './mobile-push';
 import { PairingChanged, phonePairVersion, savePair, type MobilePair } from './mobile-store';
 import { ErrorNote, useAction } from './shared';
 
@@ -120,6 +120,7 @@ export function PhonePairingPanel({ invite, pair, changed, online }: {
         const subscription = await browserPushSubscription().catch(() => undefined);
         if (!await savePair(next, version)) throw new PairingChanged();
         changed(next);
+        if (version.room && version.room !== next.room) await dismissPhoneReminders(version.room);
         await subscription?.unsubscribe().catch(() => {});
       });
     }}>
@@ -136,6 +137,7 @@ export function PhonePairingPanel({ invite, pair, changed, online }: {
           const subscription = await browserPushSubscription().catch(() => undefined);
           if (await savePair(undefined, pair.room)) {
             changed();
+            await dismissPhoneReminders(pair.room);
             await subscription?.unsubscribe().catch(() => {});
           }
         });

@@ -137,6 +137,49 @@ def test_portable_duplicate_full_restore_uses_verified_archive(tmp_path):
     assert intact.read_bytes() == payload and damaged.read_bytes() == payload[:-5]
 
 
+
+def test_portable_restore_rebinds_trash_identity_only_for_original_revision(tmp_path):
+    producer, receiver = tmp_path / "producer", tmp_path / "receiver"
+    media = tmp_path / "archives"
+
+    def archive(http, content):
+        file = import_reference(http, body=content)
+        entry = accepted(http.post(f"/api/files/{file['id']}/trash", json={
+            "path": file["path"], "revision": file["revision"],
+        }))
+        return file, entry
+
+    with app_client(producer) as http:
+        original, retained = archive(http, "经确认进入回收站的原文")
+        _, edited = archive(http, "回收前的正文")
+        (producer / edited["archivePath"]).write_text("擅自改动后的回收目录内容", encoding="utf-8")
+        choose_destination(http, media)
+        backup = make_backup(http)
+
+    with app_client(receiver) as http:
+        choose_destination(http, media)
+        preview = accepted(inspect_backup(http, backup))
+        request_restore(http, backup, preview)
+        assert wait_restore(http)["state"] == "complete"
+        assert (receiver / retained["archivePath"]).read_text(encoding="utf-8") == "经确认进入回收站的原文"
+        for entry, destination, expected in [
+            (retained, "library/imports/原件恢复.txt", 200),
+            (edited, "library/imports/改动归档.txt", 409),
+        ]:
+            response = http.post(f"/api/files/trash/{entry['id']}/restore", json={
+                "revision": entry["revision"], "path": destination,
+            })
+            assert response.status_code == expected, response.text
+
+        restored = accepted(http.get(f"/api/files/{original['id']}"))
+        assert restored["path"] == "library/imports/原件恢复.txt"
+        assert restored["revision"] == original["revision"]
+        assert restored["content"] == "经确认进入回收站的原文"
+        assert not (receiver / retained["archivePath"]).exists()
+        assert not (receiver / "library/imports/改动归档.txt").exists()
+        assert (receiver / edited["archivePath"]).read_text(encoding="utf-8") == "擅自改动后的回收目录内容"
+
+
 def test_full_restore_rejects_stale_current_state_and_wrong_password_without_switching(tmp_path):
     with app_client(tmp_path) as http:
         old = import_reference(http, body="资料.txt")
@@ -481,15 +524,23 @@ def test_full_restore_recovers_reviewed_ocr_alongside_original(tmp_path):
         reviewer = f"{endpoint}/pages/1/ocr"
         body = {"revision": original["revision"], "textRevision": None, "text": "备份中的校对正文"}
         saved = accepted(http.put(reviewer, json=body))
+        later = accepted(http.put(reviewer, json={**body, **saved, "text": "备份时启用的校对"}))
         item = make_backup(http)
-        accepted(http.put(reviewer, json={**body, **saved, "text": "备份后编辑"}))
+        accepted(http.put(reviewer, json={**body, **later, "text": "备份后编辑"}))
         preview = accepted(inspect_backup(http, item))
         assert preview["counts"]["backup"]["library_ocr_pages"] == 1
+        assert preview["counts"]["backup"]["library_ocr_versions"] == 2
         request_restore(http, item, preview)
         result = wait_restore(http)
         assert result["state"] == "complete", result
-        restored = accepted(http.get(endpoint, params={"at": 1, "revision": saved["textRevision"]}))
-        assert restored["content"] == body["text"]
+        restored = accepted(http.get(endpoint, params={"at": 1, "revision": later["textRevision"]}))
+        assert restored["content"] == "备份时启用的校对"
         assert http.get(f"{endpoint}/original").content == image
+        versions = reviewer + "/versions"
+        history = accepted(http.get(versions, params={"revision": original["revision"]}))
+        assert history["currentTextRevision"] == later["textRevision"]
+        assert {row["textRevision"] for row in history["versions"]} == {saved["textRevision"], later["textRevision"]}
+        restore_version = versions + "/" + saved["textRevision"] + "/restore"
+        assert accepted(http.post(restore_version, json={"revision": original["revision"], **later})) == saved
         hits = accepted(http.get("/api/files/search", params={"q": "校对正文"}))["hits"]
         assert hits[0]["location"]["textRevision"] == saved["textRevision"]

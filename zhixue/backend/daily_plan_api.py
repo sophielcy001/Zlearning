@@ -10,16 +10,20 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field, StringConstraints
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from .course_source_updates import pending_source_updates
 from .course_sources import observe_sources
 from .daily_plan import (
-    Availability, Booking, Slot, StudyPlan, fits, forecast, limits, load_availability, load_plan, minute, save_plan_baseline, schedule_status, standing_locks,
+    Availability, Booking, Slot, StudyPlan, appointment_subject, fits, forecast, limits, load_availability,
+    load_plan, minute, save_plan_baseline, schedule_status, standing_locks,
 )
-from .db import GenerationStep, Lesson, Project, StudyDayOverride, StudyPlanLock, StudyPlanSettings, transaction
+from .db import (
+    GenerationStep, Lesson, Project, ReminderPushClaim, ReminderReceipt, StudyDayOverride,
+    StudyPlanLock, StudyPlanSettings, transaction,
+)
 
 
 ClockText = Annotated[str, StringConstraints(pattern=r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")]
@@ -119,6 +123,17 @@ def task_change(plan: StudyPlan, move: Move) -> tuple[Booking | None, list[dict]
         if plan.completed + reserved + slot.minutes > budget:
             conflicts.append({"code": "budget", "message": "扣除当天已完成任务和已锁定任务后，剩余时间不足。"})
     return booking, conflicts
+
+
+def reset_appointment_reminders(db: Session, before: Booking | None, after: Booking | None) -> None:
+    subjects = {
+        appointment_subject(booking.lesson_id, booking.slot)
+        for booking in (before, after)
+        if booking is not None and booking.review_key is None
+    }
+    if subjects:
+        db.execute(delete(ReminderPushClaim).where(ReminderPushClaim.subject.in_(subjects)))
+        db.execute(delete(ReminderReceipt).where(ReminderReceipt.subject.in_(subjects)))
 
 
 def position(item: dict | None) -> dict | None:
@@ -259,6 +274,7 @@ def daily_plan_router(engine: Engine, folder: Path, current_day: Callable[[Sessi
             after = changed_forecast(plan, move.taskId, booking)
             if fingerprint(after, plan, target) != proposed:
                 raise HTTPException(409, stale)
+            reset_appointment_reminders(db, plan.locks.get(move.taskId), booking)
             if booking:
                 db.merge(booking.record())
             elif (row := db.get(StudyPlanLock, move.taskId)) is not None:

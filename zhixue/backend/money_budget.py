@@ -46,7 +46,7 @@ class Balance:
 def balance(db: Session, currency: str, *scope) -> Balance:
     rows = db.execute(select(ModelCharge.actual_currency, ModelCharge.actual_amount,
                              ModelCharge.estimated_amount, ModelCharge.pricing,
-                             ModelCharge.reserved_amount).where(*scope))
+                             ModelCharge.reserved_amount).where(ModelCharge.status != "not_sent", *scope))
     totals = Balance()
     with localcontext() as context:
         context.prec = 60

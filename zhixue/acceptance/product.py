@@ -32,13 +32,16 @@ class ProductConnectionError(CheckFailed):
 
 
 class Product:
-    def __init__(self, base_url: str, token: str, *, child=None):
+    def __init__(self, base_url: str, token: str, *, child=None, check_running=None):
         self.base_url = base_url
         self.token = token
         self.child = child
+        self.check_running = check_running
         self.opener = build_opener(ProxyHandler({}))
 
     def request(self, method: str, path: str, data=None, *, expected=None, raw=False):
+        if self.check_running is not None:
+            self.check_running()
         if isinstance(data, bytes):
             payload, content_type = data, "application/octet-stream"
         else:
@@ -53,7 +56,11 @@ class Product:
             with error:
                 status, body = error.code, error.read()
         except (OSError, HTTPException) as error:
+            if self.check_running is not None:
+                self.check_running()
             raise ProductConnectionError("与隔离学习服务的本机连接中断或超时。") from error
+        if self.check_running is not None:
+            self.check_running()
         check(status == expected if expected is not None else 200 <= status < 300,
               f"{method} {urlsplit(path).path} 返回 HTTP {status}。")
         return body if raw else json.loads(body)
@@ -102,7 +109,7 @@ def prepare_product(runtime: Path) -> None:
 @contextmanager
 def start_product(
     runtime: Path, folder: Path, *, entry: tuple[str, ...] = ("backend.launch",),
-    exit_reasons: dict[int, str] | None = None,
+    exit_reasons: dict[int, str] | None = None, check_running=None,
 ):
     # Force the synthetic worker's HTTP calls to stay local even with proxy settings on the host.
     environment = {**os.environ, "NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"}
@@ -123,7 +130,7 @@ def start_product(
             tokens = parse_qs(urlsplit(address.fragment).query).get("session", [])
             if address.scheme != "http" or address.hostname != "127.0.0.1" or len(tokens) != 1:
                 raise ProductConnectionError("正式学习服务没有返回有效的本机地址。")
-            yield Product(f"{address.scheme}://{address.netloc}", tokens[0], child=child)
+            yield Product(f"{address.scheme}://{address.netloc}", tokens[0], child=child, check_running=check_running)
             completed = True
         except ProductConnectionError:
             connection_failed = True

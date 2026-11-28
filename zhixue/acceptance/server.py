@@ -4,7 +4,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 import json
 from pathlib import Path
-from threading import RLock, Thread
+from threading import Event, RLock, Thread
 from time import monotonic
 from typing import Literal
 from urllib.parse import urlsplit
@@ -19,7 +19,8 @@ from backend.local_service import local_app
 from backend.model_settings_api import ModelSettingsRoute
 from .billing import billing_csv, billing_usage, connection_scope, scope_for_hosts
 from .live_config import CHECK_LABELS, MAX_CALLS, LiveInput, QualityInput, SAMPLES, VERDICTS, live_definition
-from .steps import BY_ID, STATE_LABELS, STEPS, CheckFailed
+from .report_files import replace_report
+from .steps import BY_ID, STATE_LABELS, STEPS, CheckFailed, LiveRunInterrupted
 from .usage import read_usage_checkpoint
 
 
@@ -54,8 +55,15 @@ class Run:
             return {self.clean(key): self.clean(item) for key, item in value.items()}
         return value
 
+    def check_running(self):
+        if self.data["mode"] == "real" and self.store.stopping.is_set():
+            raise LiveRunInterrupted()
+
     @contextmanager
     def step(self, step_id, inputs):
+        # Final usage collection must still run after the model service stops.
+        if step_id != "real-usage":
+            self.check_running()
         if step_id not in BY_ID or any(item["step"] == step_id for item in self.data["records"]):
             raise ValueError("Unknown or already recorded acceptance step")
         start = monotonic()
@@ -67,6 +75,11 @@ class Run:
         self.store.save(self)
         try:
             yield record["output"]
+            if step_id != "real-usage":
+                self.check_running()
+        except LiveRunInterrupted as error:
+            record.update(status="interrupted", reason=str(error))
+            raise
         except Exception as error:
             record["status"] = "failed"
             record["reason"] = self.clean(safe_reason(error))
@@ -105,6 +118,27 @@ class RunStore:
         self.lock = RLock()
         self.active = None
         self.thread = None
+        self.stopping = Event()
+        self._stop_live_service = None
+
+    @contextmanager
+    def stop_live_with(self, disconnect):
+        with self.lock:
+            if self.stopping.is_set():
+                raise LiveRunInterrupted()
+            self._stop_live_service = disconnect
+        try:
+            yield
+        finally:
+            with self.lock:
+                self._stop_live_service = None
+
+    def request_shutdown(self):
+        self.stopping.set()
+        with self.lock:
+            if self._stop_live_service is not None:
+                with suppress(OSError):
+                    self._stop_live_service()
 
     def path(self, identity) -> Path:
         return self.directory / (str(UUID(str(identity))) + ".json")
@@ -117,7 +151,7 @@ class RunStore:
         try:
             with temporary.open("w", encoding="utf-8") as stream:
                 json.dump(data, stream, ensure_ascii=False, indent=2)
-            temporary.replace(path)
+            replace_report(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -127,6 +161,8 @@ class RunStore:
 
     def start(self, selection: LiveInput | None = None) -> str:
         with self.lock:
+            if self.stopping.is_set():
+                raise HTTPException(503, "验收服务正在退出。")
             if self.active is not None:
                 raise HTTPException(409, "已有验收运行正在执行。")
             run = Run(self, selection)
@@ -143,6 +179,8 @@ class RunStore:
             else:
                 self.execute_live(run, selection)
             run.data["state"] = "passed"
+        except LiveRunInterrupted as error:
+            run.data.update(state="interrupted", reason=str(error))
         except Exception as error:
             run.data.update(state="failed", reason=run.clean(safe_reason(error)))
         finally:
@@ -285,6 +323,7 @@ def create_app(store: RunStore, token: str) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app):
         yield
+        store.request_shutdown()
         await to_thread(store.wait)
 
     app = local_app(token, lifespan=lifespan)

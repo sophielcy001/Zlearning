@@ -19,6 +19,7 @@ from .backup_restore import exclusive_lease, recover_full_restore, restore_root
 from .db import ROOT
 from .process_io import watch_parent_disconnect
 from .restore_runtime import RestoreRuntime, attach_restore
+from .semantic_model import prepare_windows_semantic_runtime
 from .workspace_setup import SERVICE_LOCK, WorkspaceError, WorkspaceSetup, attach_workspace, setup_app
 
 
@@ -167,6 +168,7 @@ def run(data: Path, port: int, stdio: bool, open_browser: bool, *, desktop_offli
         return 1
     control = data.resolve()
     control.mkdir(parents=True, exist_ok=True)
+    prepare_windows_semantic_runtime()
     stopped = Event()
 
     if stdio:

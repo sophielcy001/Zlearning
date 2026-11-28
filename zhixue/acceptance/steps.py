@@ -12,8 +12,13 @@ class Step:
 STEPS = (
     Step("setup", "启动隔离环境", "通过正式启动入口初始化临时数据库与知识库，并配置本机模拟模型。"),
     Step("library-search", "知识库检索定位", "以单字、双字和混排短语检索临时资料，核对摘要、原文位置和版本。"),
+    Step("library-semantic-first", "语义索引首次启用", "暂停首次缓存提交，同时核对关键词、混合检索与原文。提交后复核索引状态和重复启用。", "library-search"),
     Step("library-reindex", "外部修改与索引重建", "改动隔离原件，核对旧命中消失、新位置出现和重建后原件字节。", "library-search"),
     Step("library-anchor", "拒绝失效原文位置", "验证旧版本与不存在的行分别得到明确错误，并能直接打开当前文件。", "library-search"),
+    Step("library-wiki", "双链改名与反向定位", "核对同名目标选择、改名后稳定编号和反向链接的原文行及版本。", "library-search"),
+    Step("library-original-return", "原件归位与再次保存", "把合成原件移出、改写并放回，再原子替换保存。核对原文件编号、版本、原文行和双链。", "library-search"),
+    Step("library-original-restart", "重启后原件归位读回", "查看重启后的原件摘要、路径、旧双链和知识库登记。", "library-search"),
+    Step("library-trash", "回收站旧路径双链", "核对移入前的引用位置与重建索引后的回收状态。", "library-search"),
     Step("ocr", "单页识别授权与范围", "实跑本机 OCR，再用独立授权发送合成 PDF 的所选页图，核对接收内容和未确认草稿。"),
     Step("ocr-conflict", "校对冲突与索引", "保留先保存的校对和原件，拒绝旧版本及撤销后的外部请求。", "ocr"),
     Step("goal", "提交学习目标", "从目标对话整理目标卡，确认主模型发送范围后提交，重复提交沿用同一项目。"),
@@ -31,11 +36,14 @@ STEPS = (
     Step("review", "生成复习题与独立评价", "从已核验依据生成复习题，到期后提交，等待评阅 Worker。"),
     Step("schedule", "安排下次复习", "根据独立评价结果变更阶段并更新计划，仍能查看原答案。"),
     Step("schedule-delay", "延迟评分与单轮待办", "模拟逾期作答和晚到评分，核对实际提交日、真实到期日和唯一待办。", "schedule"),
-    Step("restart", "关闭与重启恢复", "重新启动同一隔离工作区，检查课程、笔记、复习和数据库。"),
+    Step("schedule-report", "正式复习明细与提交日", "核对待评和已通过的同一正式复习，确认明细及汇总归入实际提交日。", "schedule"),
+    Step("restart", "关闭与重启恢复", "重新启动同一隔离工作区，检查课程、笔记、复习报告、双链原文和数据库。"),
     Step("restart-unsent", "重启恢复未发送预留", "终止持有未发送草稿预留的 Worker，用原额度续写同一知识点。", "restart"),
     Step("restart-sent", "重启核对已发送请求", "在回环接口收到草稿请求后中断，核对未知费用和人工继续。", "restart"),
     Step("conflict", "文件版本冲突", "外部更改笔记后尝试保存旧稿，由用户预览并合并两个版本。"),
     Step("backup", "加密备份与恢复", "用临时口令创建加密归档，预览并恢复资料以及整库。"),
+    Step("backup-trash", "加密备份找回回收原件", "从实际加密备份恢复到另外的工作区并找回同一版本原件。", "backup"),
+    Step("backup-trash-review", "核对回收原件与重启读回", "模拟换机后文件身份失配，核对版本、过期确认和恢复后的重启证据。", "backup"),
     Step("revision-update", "来源变更与课程修订", "实际修改合成资料，检查今天的待办和原引文对照。"),
     Step("revision-preview", "拒绝过期发送预览", "预览所选资料后再改原件，验证旧确认被拒绝且模型未收到请求。", "revision-update"),
     Step("revision-keep", "核验后选择保留旧版", "完成一次独立核验，选择保留旧版，检查正式正文与来源待办。", "revision-update"),
@@ -84,6 +92,11 @@ STATE_LABELS = {
 
 class CheckFailed(RuntimeError):
     """A verification failure with a fixed message that can go into a report."""
+
+
+class LiveRunInterrupted(CheckFailed):
+    def __init__(self):
+        super().__init__("验收已请求退出，后续模型步骤已中断。")
 
 
 def check(condition, reason: str) -> None:

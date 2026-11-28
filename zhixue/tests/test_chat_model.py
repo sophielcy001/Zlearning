@@ -28,7 +28,7 @@ def worker(folder, calls, answer="实测模型回复"):
     try:
         claim = reserve_reply(engine, datetime.now(UTC))
         if claim:
-            dispatch_reply(engine, claim, transport=transport)
+            dispatch_reply(engine, claim, transport=transport, workspace=folder)
         return claim is not None
     finally:
         engine.dispose()

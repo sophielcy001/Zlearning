@@ -12,7 +12,7 @@ from backend.storage_files import sqlite_file_uri
 from test_first_use import accepted, import_reference, launch, reached, until
 
 OLD = '0051_course_anchor_links'
-NEW = '0052_recognition_grants'
+NEW = '0066_trash_reference_status'
 NOTE = '迁移前写入的笔记。'
 SOURCE = '迁移前导入的文本。'
 
@@ -23,7 +23,7 @@ def inspect_database(path):
                 db.execute('PRAGMA quick_check').fetchone()[0])
 
 
-def test_0051_keeps_course_note_source_and_reviews_when_launch_upgrades_to_0052(tmp_path):
+def test_0051_keeps_course_note_source_and_reviews_when_launch_upgrades_to_current_schema(tmp_path):
     control = tmp_path / '应用入口'
     workspace = tmp_path / '实际学习工作区'
     project = '/api/projects/' + str(uuid4())

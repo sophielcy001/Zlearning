@@ -1,4 +1,5 @@
 import { execFileSync, spawn, type ChildProcessByStdio } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -9,12 +10,16 @@ import { devices, expect, test, type Page } from '@playwright/test';
 
 const python = resolve(process.platform === 'win32' ? '.venv/Scripts/python.exe' : '.venv/bin/python');
 const packagedService = process.env.ZHIXUE_TEST_SERVICE;
+const mobileSite = process.env.ZHIXUE_TEST_MOBILE_SITE;
 type HttpsDeployment = {
   phoneOrigin: string; relayOrigin: string; relayPort: string;
   bundle: string; relayPython: string; chromeSpki: string;
 };
 const deployment: HttpsDeployment | undefined = process.env.ZHIXUE_TEST_MOBILE_DEPLOYMENT
   ? JSON.parse(process.env.ZHIXUE_TEST_MOBILE_DEPLOYMENT) : undefined;
+if (mobileSite && (!packagedService || deployment)) {
+  throw new Error('An installed phone site requires a packaged service and no separate HTTPS deployment.');
+}
 type Child = ChildProcessByStdio<Writable, Readable, Readable>;
 
 async function service(args: string[], address: RegExp, stream: 'stdout' | 'stderr', graceful = false,
@@ -57,6 +62,45 @@ async function service(args: string[], address: RegExp, stream: 'stdout' | 'stde
   }
 }
 
+async function oldReminderFixture(page: Page, workspace: string) {
+  const room = await page.evaluate(() => new Promise<string>((resolve, reject) => {
+    const open = indexedDB.open('zhixue-mobile-study');
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result;
+      const tx = db.transaction('device');
+      const pair = tx.objectStore('device').get('pair');
+      tx.oncomplete = () => { db.close(); resolve(pair.result.room); };
+      tx.onabort = () => { db.close(); reject(tx.error); };
+    };
+  }));
+  const oldDelivery = randomUUID(), unaffectedDelivery = randomUUID();
+  const oldTag = 'zhixue-' + oldDelivery, unaffectedTag = 'zhixue-' + unaffectedDelivery;
+  const pairing = (value: string) => createHash('sha256').update(value).digest('hex');
+  const notices = [{ delivery: oldDelivery, pairing: pairing(room) },
+    { delivery: unaffectedDelivery, pairing: pairing('different-notice-fixture-room') }];
+  await page.evaluate(async ({ workspace, notices }) => {
+    const registration = await navigator.serviceWorker.ready;
+    for (const notice of notices) {
+      await registration.showNotification('智学', { body: '有复习待办。', tag: 'zhixue-' + notice.delivery,
+        data: { ...notice, workspace, v: 1, lessonId: null } });
+    }
+  }, { workspace, notices });
+  const visible = () => page.evaluate(async tags => {
+    const registration = await navigator.serviceWorker.ready;
+    return (await registration.getNotifications()).map(note => note.tag).filter(tag => tags.includes(tag));
+  }, [oldTag, unaffectedTag]);
+  await expect.poll(visible).toEqual(expect.arrayContaining([oldTag, unaffectedTag]));
+  return async () => {
+    await expect.poll(visible, { message: 'retire only the system reminder for the disabled or replaced pairing' })
+      .toEqual([unaffectedTag]);
+    await page.evaluate(async tag => {
+      const registration = await navigator.serviceWorker.ready;
+      for (const note of await registration.getNotifications({ tag })) note.close();
+    }, unaffectedTag);
+  };
+}
+
 test.use({ ...devices['Pixel 7'], channel: 'chrome' });
 if (deployment) {
   const phone = new URL(deployment.phoneOrigin);
@@ -83,8 +127,10 @@ test('paired phone shares offline work, timers and reminders through an encrypte
     services.push(child);
     return child;
   };
-  const desktopArgs = ['-m', 'backend.launch', '--port', '0', '--stdio', '--data', folder];
-  const startDesktop = () => start(desktopArgs, /^(http:\/\/127\.0\.0\.1:\d+\/#\/\?session=\S+)$/, 'stdout', true);
+  const startDesktop = () => start(['-m', 'backend.launch', '--port', '0', '--stdio', '--data', folder],
+    /^(http:\/\/127\.0\.0\.1:\d+\/#\/\?session=\S+)$/, 'stdout', true);
+  const startPhoneSite = (directory = 'dist') => start(['-m', 'http.server', '0', '--bind', '127.0.0.1', '--directory', directory],
+    /Serving HTTP on .*? \((http:\/\/127\.0\.0\.1:\d+\/)\)/, 'stdout');
   let computer: Awaited<ReturnType<typeof service>> | undefined;
   const secretHeaders = () => {
     const session = new URLSearchParams(computer!.url.hash.split('?')[1]).get('session');
@@ -102,9 +148,18 @@ test('paired phone shares offline work, timers and reminders through an encrypte
     await desktop.getByRole('button', { name: '同步', exact: true }).click();
   };
   try {
-    const hosted = deployment ? { url: new URL(deployment.phoneOrigin) }
-      : await start(['-m', 'http.server', '0', '--bind', '127.0.0.1', '--directory', 'dist'],
-        /Serving HTTP on .*? \((http:\/\/127\.0\.0\.1:\d+\/)\)/, 'stdout');
+    let hosted: { url: URL };
+    if (deployment) {
+      hosted = { url: new URL(deployment.phoneOrigin) };
+    } else if (mobileSite) {
+      hosted = await test.step('serves verified mobile assets from the installed service', async () => {
+        const site = await startPhoneSite(mobileSite);
+        await expect(await page.request.get(new URL('/mobile/', site.url).href)).toBeOK();
+        return site;
+      });
+    } else {
+      hosted = await startPhoneSite();
+    }
     const relayRuntime = deployment && { executable: deployment.relayPython, directory: deployment.bundle };
     const startRelay = (port: string) => start(['-m', 'backend.mobile_relay', '--port', port, '--origin', hosted.url.origin],
       /Uvicorn running on (http:\/\/127\.0\.0\.1:\d+)/, 'stderr', false, relayRuntime);
@@ -284,9 +339,32 @@ test('paired phone shares offline work, timers and reminders through an encrypte
 
       await page.getByRole('button', { name: '启用手机推送', exact: true }).click();
       await expect(page.getByText('已启用手机系统推送。')).toBeVisible({ timeout: 12000 });
+      const verifyRetired = await oldReminderFixture(page, (await api<{ workspace: string }>('/mobile/catalog')).workspace);
+      // Keep the last desktop registration, but simulate a browser that has rotated its endpoint.
+      await page.evaluate(() => sessionStorage.setItem('rotated-push-fixture',
+        'https://fcm.googleapis.com/fcm/send/zhixue-browser-rotated-fixture'));
+      await context.addInitScript(() => {
+        const endpoint = sessionStorage.getItem('rotated-push-fixture');
+        if (!endpoint) return;
+        PushManager.prototype.getSubscription = async () => sessionStorage.getItem('rotated-push-fixture') ? {
+          endpoint,
+          options: { applicationServerKey: null, userVisibleOnly: true },
+          async unsubscribe() {
+            sessionStorage.removeItem('rotated-push-fixture');
+            return true;
+          },
+        } as PushSubscription : null;
+      });
       await context.setOffline(true);
+      await page.reload();
       await expect(page.getByText('离线', { exact: true })).toBeVisible();
+      await page.getByRole('button', { name: '同步', exact: true }).click();
+      await page.getByText('手机系统推送', { exact: true }).click();
+      await expect.poll(() => page.evaluate(async () =>
+        (await (await navigator.serviceWorker.ready).pushManager.getSubscription())?.endpoint)).toMatch(/rotated-fixture$/);
       await page.getByRole('button', { name: '停用手机推送', exact: true }).click();
+      await expect.poll(() => page.evaluate(() => sessionStorage.getItem('rotated-push-fixture'))).toBeNull();
+      await verifyRetired();
       await expect(page.getByText('等待同步停用手机推送。', { exact: true })).toBeVisible();
       await page.reload();
       await page.getByRole('button', { name: '同步', exact: true }).click();
@@ -976,7 +1054,9 @@ test('paired phone shares offline work, timers and reminders through an encrypte
       expect(committedNote.content).toBe(heldDraft);
       const waiting = await localNote();
       expect(waiting).toMatchObject({ content: heldDraft, editedAt: expect.any(String), pending: { id: expect.any(String) } });
+      const verifyRetired = await oldReminderFixture(page, currentWorkspace);
       await page.getByRole('button', { name: '移除本机配对' }).click();
+      await verifyRetired();
       await expect(page.getByText('等待连接', { exact: true })).toBeVisible();
       await expect(page.getByText('请在手机上打开电脑生成的配对链接。')).toBeVisible();
 
@@ -1271,12 +1351,14 @@ test('paired phone shares offline work, timers and reminders through an encrypte
         await desktop.getByLabel('手机网页地址').fill(hosted.url.origin);
         await desktop.getByLabel('中继地址').fill(relayOrigin);
         await desktop.getByRole('button', { name: '生成配对链接' }).click();
+        const verifyRetired = await oldReminderFixture(other, (await api<{ workspace: string }>('/mobile/catalog')).workspace);
         await other.goto(await invite.inputValue());
         await other.getByRole('button', { name: '申请配对' }).click();
         await expect(winningCode).toHaveText(/^[0-9A-F]{8}$/);
         const subscription = () => other.evaluate(async () =>
           (await (await navigator.serviceWorker.ready).pushManager.getSubscription())?.endpoint ?? null);
         await expect.poll(subscription, { message: 'replacing a pair must clear its original browser subscription' }).toBeNull();
+        await verifyRetired();
         await expect(desktop.getByLabel('电脑配对码')).toHaveText(await winningCode.innerText());
         await desktop.getByRole('button', { name: '确认配对码并批准' }).click();
         await expect(other.getByText('电脑已连接', { exact: true })).toBeVisible({ timeout: 15000 });

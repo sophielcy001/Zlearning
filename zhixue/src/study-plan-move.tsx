@@ -3,6 +3,15 @@ import { api, dateLabel } from './api';
 import { ErrorNote, Loading, Modal, useAction } from './shared';
 
 export const PLAN = '/study-plan';
+export const LOCK_STATUS = {
+  future: '已排在未来日期',
+  missed: '已过计划日期',
+  paused: '项目已暂停',
+  before_due: '原到期日已变化',
+  unavailable: '暂不可安排',
+  outside_hours: '时段需调整',
+};
+export type LockStatus = keyof typeof LOCK_STATUS;
 export const WEEKDAYS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
 
 export function dayLabel(day: string) {

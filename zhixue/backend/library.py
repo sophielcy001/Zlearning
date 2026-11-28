@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+from unicodedata import normalize
 from tempfile import NamedTemporaryFile
 
 from sqlalchemy import select
@@ -85,6 +86,10 @@ def note_title(note: Note | None, lesson_title: str | None = None) -> str:
     if note and note.title:
         return note.title
     return f"{lesson_title} · 笔记" if lesson_title else "未命名笔记"
+
+
+def wiki_target_key(value: str) -> str:
+    return normalize("NFC", value.strip().replace("\\", "/")).casefold()
 
 
 def documents(db: Session, folder: Path, known: set[str]) -> list[LibraryDocument]:

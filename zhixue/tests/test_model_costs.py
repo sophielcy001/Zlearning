@@ -92,6 +92,54 @@ def test_generation_preserves_each_price_snapshot_and_usage_after_deletion(tmp_p
         assert ok(http.get(LEDGER)) == ledger
 
 
+def test_confirmed_transport_cancellation_releases_cost_and_survives_worker_restart(tmp_path):
+    from sqlalchemy import select
+
+    from acceptance.usage import read_usage
+    from backend.db import ModelCharge, ModelUse, transaction
+    from backend.model_protocols import TransportNotSent
+    from backend.model_study import settle_interrupted
+    from backend.model_usage import billed_calls, billing_day
+    from backend.money_budget import balance
+
+    def decline(*_):
+        raise TransportNotSent()
+
+    with ledger_client(tmp_path) as http:
+        model = connection(http)
+        set_pricing(http, model, "2", "4")
+        ok(http.patch("/api/models/roles", json={"main": model["id"]}))
+        endpoint, goal, preview = consent_request(http, 1)
+        ok(http.post(endpoint, json={**goal, "modelConsent": preview["consent"]}))
+        with pytest.raises(TransportNotSent):
+            run(tmp_path, decline, now=lambda: WHEN)
+
+        ledger = ok(http.get(LEDGER))
+        assert ledger["total"] == ledger["summary"]["unknownCalls"] == 0
+        assert ledger["items"] == []
+        usage = read_usage(tmp_path / "zhixue.sqlite3", final=True)
+        assert usage["计入调用"] == usage["费用未知的调用"] == 0
+        assert usage["发送前取消或拦截"] == 1
+
+        engine = open_db(tmp_path)
+        try:
+            with transaction(engine, write=False) as db:
+                call = db.scalars(select(ModelUse)).one()
+                charge = db.get(ModelCharge, (ModelUse.__tablename__, call.id))
+                assert call.status == "sending" and charge.status == "not_sent" and charge.finished_at is not None
+                assert billed_calls(db, billing_day(WHEN)) == 0
+                assert balance(db, "CNY").view() == {"settled": "0", "reserved": "0", "unknownCalls": 0}
+            settle_interrupted(engine, WHEN)
+            with transaction(engine, write=False) as db:
+                assert db.scalars(select(ModelUse)).one().status == "not_sent"
+        finally:
+            engine.dispose()
+
+        assert run(tmp_path, lambda *_: reply(json.dumps(PLAN), {"prompt_tokens": 6, "completion_tokens": 4}), now=lambda: WHEN)
+        updated = ok(http.get(LEDGER))
+        assert updated["total"] == 1 and updated["summary"]["unknownCalls"] == 0
+
+
 def test_connection_tests_record_documented_actual_zero_and_unknown_cost(tmp_path):
     usage = iter((
         {"prompt_tokens": 6, "completion_tokens": 2, "cost": 0.012345678, "is_byok": False},

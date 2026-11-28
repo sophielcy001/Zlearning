@@ -1,4 +1,4 @@
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import aliased
 
 from .db import ChatMessage, ChatReply
@@ -23,6 +23,10 @@ REPLY_ERRORS = {
     "invalid_response": "主模型返回的内容无法使用。",
     "restored": "此问题从备份恢复，请重新确认后继续。",
     "dispatch_failed": "后台任务在请求发送前发生异常，请重试。",
+    "skill_unavailable": "确认的 Skill 版本已不可用，请重新确认发送范围。",
+    "knowledge_changed": "这次确认的知识库资料或授权已变化。可重新确认问题，或新建一轮检索。",
+    "memory_changed": "这次确认的记忆或 Agent 读取授权已变化，请重新确认发送范围。",
+    "mcp_changed": "仓库连接或 Agent 读取授权已变化，请重新确认。",
     "uncertain": "上次发送结果未能确认。再次发送可能增加一次费用。",
 }
 
@@ -32,7 +36,10 @@ def completed_history(db, conversation_id: str) -> list[dict]:
     rows = db.execute(select(ChatMessage.text, answer.text).select_from(ChatReply)
                       .join(ChatMessage, ChatMessage.id == ChatReply.id)
                       .join(answer, answer.id == ChatReply.reply_id)
-                      .where(ChatMessage.conversation_id == conversation_id, ChatReply.state == "answered")
+                      .where(ChatMessage.conversation_id == conversation_id, ChatReply.state == "answered",
+                             func.coalesce(func.json_array_length(ChatReply.agent_scope, "$.knowledge.excerpts"), 0) == 0,
+                             func.coalesce(func.json_array_length(ChatReply.agent_scope, "$.memories"), 0) == 0,
+                             func.json_extract(ChatReply.agent_scope, "$.mcp").is_(None))
                       .order_by(ChatMessage.position.desc()).limit(HISTORY_TURNS)).all()
     return [{"role": role, "text": text[:HISTORY_TEXT_LIMIT]} for question, reply in reversed(rows)
             for role, text in (("user", question), ("assistant", reply))]
@@ -44,5 +51,7 @@ def model_reply_metadata(db, messages: list[str]) -> dict:
     return {reply.reply_id: {"modelReply": {
         "questionId": reply.id, "questionText": question, "hasHistory": bool(reply.history), "state": reply.state,
         "recipient": reply.recipient, "errorCode": reply.error,
+        **({"agent": {key: reply.agent_scope[key] for key in ("id", "name", "skill", "skillMode", "knowledge", "memories", "mcp")
+                      if key in reply.agent_scope}} if reply.agent_scope else {}),
         "error": REPLY_ERRORS.get(reply.error, "暂时无法完成模型回复。") if reply.state == "blocked" else None,
     }} for reply, question in rows}

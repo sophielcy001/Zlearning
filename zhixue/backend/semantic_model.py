@@ -1,6 +1,9 @@
 from hashlib import file_digest, sha256
+from importlib import import_module
+import logging
 from pathlib import Path
 import ssl
+import sys
 from threading import Event, Lock
 from urllib.request import HTTPSHandler, HTTPRedirectHandler, build_opener
 
@@ -18,6 +21,18 @@ MODEL_BYTES = sum(size for _, size, _ in ASSETS)
 CHUNK_TOKENS = 192
 OVERLAP = 24
 INFERENCE_BATCH = 16
+logger = logging.getLogger(__name__)
+
+
+def prepare_windows_semantic_runtime() -> None:
+    if sys.platform != "win32":
+        return
+    # Load the native NumPy module before the background Windows pipe reader
+    # starts. Loading it later from the inference thread can stall the index.
+    try:
+        import_module("numpy")
+    except (ImportError, OSError) as error:
+        logger.warning("NumPy startup failed (%s)", type(error).__name__)
 
 
 class HTTPSOnly(HTTPRedirectHandler):

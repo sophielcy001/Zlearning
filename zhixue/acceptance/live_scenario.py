@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from sqlalchemy.exc import SQLAlchemyError
 
+from backend.model_protocols import MODEL_HTTP_TIMEOUT
 from backend.money_budget import MONEY_ERRORS
 
 from .live_config import MAX_CALLS, SAMPLE_LIMITS, SAMPLES, describe_connection
@@ -173,7 +174,9 @@ def run_review(run, api, sample, target, lesson_id, learned):
                     raise CheckFailed(job["error"] or "模型复习题未能生成。")
             return None if jobs else reviews()
 
-        objective = until(prepared, "已学课程没有在时限内生成复习题。", WAIT)[0]
+        # A verified proof queues one request, and a priced sample can run them serially.
+        generation_wait = WAIT + max(0, sections - 1) * MODEL_HTTP_TIMEOUT
+        objective = until(prepared, "已学课程没有在时限内生成复习题。", generation_wait)[0]
         first_due = (date.fromisoformat(learned) + timedelta(days=1)).isoformat()
         check(objective["dueOn"] == first_due and objective["kind"] == "model", "首次复习没有排在已学的次日。")
         api.post("/api/demo/next-day")
@@ -256,7 +259,7 @@ def closing_session(run, selection, sample, runtime, folder):
             prepare_product(runtime)
             package = runtime / "acceptance"
             package.mkdir()
-            for filename in ("__init__.py", "live_runtime.py", "usage.py"):
+            for filename in ("__init__.py", "live_runtime.py", "usage.py", "report_files.py"):
                 copyfile(Path(__file__).with_name(filename), package / filename)
             entry = ("acceptance.live_runtime", "--limit", str(MAX_CALLS),
                      "--usage-checkpoint", str(run.store.usage_path(run.identity).resolve()))
@@ -265,7 +268,11 @@ def closing_session(run, selection, sample, runtime, folder):
                 entry += ("--cost-limit", selection.budget.limit.model_dump_json())
                 pricing = {"main": selection.budget.mainPricing, "review": selection.budget.reviewPricing}
                 output["金额控制"] = selection.budget.model_dump()
-            api = sessions.enter_context(start_product(runtime, folder, entry=entry, exit_reasons=WORKER_EXIT_REASONS))
+            run.check_running()
+            api = sessions.enter_context(start_product(
+                runtime, folder, entry=entry, exit_reasons=WORKER_EXIT_REASONS, check_running=run.check_running,
+            ))
+            sessions.enter_context(run.store.stop_live_with(api.child.stdin.close))
             check(not api.get("/api/state")["recentProjects"], "联调没有进入空白隔离工作区。")
             if pricing:
                 # Keep later lessons from competing with the sample's review for a reserved call.

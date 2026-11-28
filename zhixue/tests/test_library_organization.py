@@ -1,7 +1,9 @@
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
+import sqlite3
 from zipfile import ZipFile
 
-from backend import library_copies
+from backend import library_copies, library_metadata
 
 from test_library_folders import create
 from test_library_locations import app, get, upload
@@ -63,6 +65,43 @@ def test_tags_filter_first_and_metadata_survives_reindex_and_restart(tmp_path):
         assert restored.is_success, restored.text
         assert get(http, f"/api/files/{target}")["tags"] == file["tags"]
         assert get(http, f"/api/files/{target}")["favorite"] is True
+
+
+def test_recent_follows_commit_order_with_identical_or_reversed_wall_clock(tmp_path, monkeypatch):
+    clock = [datetime(2026, 11, 21, 2, 38, 54, 443324, tzinfo=UTC)]
+
+    class FixedClock:
+        @classmethod
+        def now(cls, _timezone):
+            return clock[0]
+
+    monkeypatch.setattr(library_metadata, "datetime", FixedClock)
+    phrase = "并列排序样本"
+    with app(tmp_path) as http:
+        early = upload(http, "A.md", (phrase + "甲").encode())
+        latest = upload(http, "Z.md", (phrase + "乙").encode())
+        old = upload(http, "旧记录.md", (phrase + "丙").encode())
+        get(http, "/api/files")
+
+        def opened(file):
+            return http.post(f"/api/files/{file}/opened").json()["lastViewedAt"]
+
+        assert opened(early) == opened(latest)
+        hits = get(http, "/api/files/search", q=phrase, shelf="recent")["hits"]
+        assert [hit["id"] for hit in hits] == [latest, early]
+        with sqlite3.connect(tmp_path / "zhixue.sqlite3") as db:
+            db.execute("INSERT INTO library_file_activity (file_id, favorite, last_viewed_at) VALUES (?, ?, ?)",
+                       (old, 1, (clock[0] + timedelta(days=1)).isoformat()))
+        clock[0] -= timedelta(minutes=1)
+        assert opened(early) == clock[0].isoformat(timespec="microseconds")
+
+    with app(tmp_path) as http:
+        hits = get(http, "/api/files/search", q=phrase, shelf="recent")["hits"]
+        assert [hit["id"] for hit in hits] == [early, latest, old]
+        files = {file["id"]: file for file in get(http, "/api/files")}
+        assert files[early]["lastViewedOrder"] > files[latest]["lastViewedOrder"] > 0
+        assert files[early]["lastViewedAt"] < files[latest]["lastViewedAt"]
+        assert files[old]["favorite"] is True and files[old].get("lastViewedOrder") is None
 
 
 def test_batch_move_previews_collisions_and_retries_a_partial_result(tmp_path):

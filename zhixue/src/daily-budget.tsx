@@ -14,6 +14,8 @@ const KINDS = {
   answer: '课内答疑',
   chat: '自由聊天',
   goal_authoring: '学习目标整理',
+  agent_authoring: '专业 Agent 起草',
+  memory_inference: 'AI 记忆整理',
   consolidation: '学完后的答疑整理',
   prerequisite: '前置知识讲解',
   stage_review: '阶段成果评审',
@@ -37,6 +39,8 @@ type BudgetState = {
 };
 
 function targetUrl(item: Task) {
+  if (item.kind === 'agent_authoring') return '/settings/agents';
+  if (item.kind === 'memory_inference') return '/settings/memory?view=pending';
   if (item.kind === 'graph') return '/library?view=graph&review=1';
   if (item.kind === 'classification') return '/library?classify=1';
   if (item.conversationId) return chatUrl(item.conversationId);

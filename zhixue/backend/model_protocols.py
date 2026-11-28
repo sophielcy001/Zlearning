@@ -29,10 +29,15 @@ PROVIDERS = {
 }
 PROMPT = "Reply with OK."
 OUTPUT_LIMIT = 512
+MODEL_HTTP_TIMEOUT = 20
 RESPONSE_LIMIT = 256 * 1024
 COMPLETION_LIMIT_PROVIDERS = {"minimax", "openai", "kimi", "doubao"}
 Transport = Callable[[str, dict[str, str], dict], tuple[int, bytes]]
 OPENROUTER_CHAT = "https://openrouter.ai/api/v1/chat/completions"
+
+
+class TransportNotSent(Exception):
+    """The transport declined the request before attempting network I/O."""
 
 
 def normalize_endpoint(value: str) -> str:
@@ -84,7 +89,7 @@ def post_json(address: str, headers: dict[str, str], payload: dict) -> tuple[int
     return post_bytes(address, {"Content-Type": "application/json", **headers}, json.dumps(payload).encode("utf-8"))
 
 
-def post_bytes(address: str, headers: dict[str, str], body: bytes, *, timeout: int = 20,
+def post_bytes(address: str, headers: dict[str, str], body: bytes, *, timeout: int = MODEL_HTTP_TIMEOUT,
                upload_guard: Callable[[], AbstractContextManager[None]] | None = None) -> tuple[int, bytes]:
     parts = urlsplit(address)
     connection_type = HTTPSConnection if parts.scheme == "https" else HTTPConnection

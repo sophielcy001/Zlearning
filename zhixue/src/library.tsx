@@ -1,6 +1,6 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { Fragment, lazy, Suspense, useCallback, useEffect, useEffectEvent, useRef, useState } from 'react';
 import { BookOpen, ChevronLeft, ChevronRight, Copy, Download, FileText, FolderInput, FolderOpen, NotebookPen, PencilLine, RefreshCw, Search, Sparkles, Square, SquareCheck, Star, Tags, Trash2, X } from 'lucide-react';
-import { useSearchParams } from 'react-router-dom';
+import { parsePath, useLocation, useSearchParams } from 'react-router-dom';
 import remarkMath from 'remark-math';
 import { api, apiResponse, type LibraryFile, type LibraryHit, type LibraryItem, type LibraryMatches, type ProjectOption, type SemanticIndexStatus, type WebSource } from './api';
 import { BackedStatus, Empty, ErrorNote, FileUpload, Loading, Markdown, Modal, useAction, useRead } from './shared';
@@ -10,11 +10,12 @@ import { NotePanel } from './notes';
 import { WebImportButton } from './web-import';
 import { WikiBacklinks, WikiDestination } from './wiki-links-ui';
 import { WikiText } from './wiki-text';
-import { LibraryViewSwitch } from './library-views';
+import { libraryFileParams, LibraryViewSwitch } from './library-views';
 import { FolderDialog, LIBRARY_ROOT, LibraryFolderList, parentFolder, type LibraryFolder } from './library-folders';
 import { downloadFile, FileBatchDialog, FileTagDialog, LIBRARY_BATCH_LIMIT, type BatchFileAction, type SelectedLibraryFile } from './library-organize';
 import { CLASSIFICATION, CLASSIFICATION_FILE_LIMIT, ClassificationRequest, ClassificationReview, type ClassificationQueue } from './library-classification';
 import { ExternalRecognition } from './recognition';
+import { OcrHistory } from './library-ocr-history';
 
 const LibraryGraph = lazy(() => import('./library-graph').then(module => ({ default: module.LibraryGraphPage })));
 
@@ -29,7 +30,6 @@ const TYPES = [
 const FORMATS = { txt: 'TXT', md: 'Markdown', pdf: 'PDF', docx: 'Word', png: 'PNG', jpg: 'JPG', jpeg: 'JPEG', html: '网页' };
 const STATUSES = { ready: '', partial: '部分文字可搜索', missing: '原件缺失', failed: '无法索引正文', empty: '无可搜索文字',
   trashed: '已移入回收站', purged: '回收站原件已清理' };
-type FileShelf = 'all' | 'favorites' | 'recent';
 const SEMANTIC_INDEX = '/files/semantic-index';
 
 export function LibraryPage() {
@@ -40,16 +40,20 @@ export function LibraryPage() {
 }
 
 function LibraryFiles() {
+  const { pathname } = useLocation();
   const [params, setParams] = useSearchParams();
-  const [filter, setFilter] = useState<string>('all');
-  const [query, setQuery] = useState('');
-  const [searchTerm, setSearchTerm] = useState('');
-  const [searchMode, setSearchMode] = useState<'keyword' | 'hybrid'>('keyword');
-  const [scope, setScope] = useState('current');
-  const [format, setFormat] = useState('');
-  const [project, setProject] = useState('');
-  const [tag, setTag] = useState('');
-  const [shelf, setShelf] = useState<FileShelf>('all');
+  const query = (params.get('q') ?? '').slice(0, 120);
+  const [searchTerm, setSearchTerm] = useState(query.trim());
+  const filter = TYPES.find(type => type.key === params.get('kind'))?.key ?? 'all';
+  const searchMode = params.get('mode') === 'hybrid' ? 'hybrid' : 'keyword';
+  const scope = params.get('scope') === 'all' ? 'all' : 'current';
+  const requestedFormat = params.get('format') ?? '';
+  const format = Object.hasOwn(FORMATS, requestedFormat) ? requestedFormat : '';
+  const requestedProject = params.get('project') ?? '';
+  const project = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(requestedProject) ? requestedProject : '';
+  const tag = (params.get('tag') ?? '').slice(0, 300);
+  const requestedShelf = params.get('shelf');
+  const shelf = requestedShelf === 'favorites' || requestedShelf === 'recent' ? requestedShelf : 'all';
   const [rebuilt, setRebuilt] = useState(false);
   const [creatingNote, setCreatingNote] = useState(false);
   const [selecting, setSelecting] = useState(false);
@@ -75,7 +79,8 @@ function LibraryFiles() {
   const fullFile = !!selected && params.has('open');
   const at = params.get('at');
   const revision = params.get('revision');
-  const browsing = !query.trim();
+  const activeQuery = query.trim();
+  const browsing = !activeQuery;
   const request = new URLSearchParams({ q: searchTerm });
   const hybrid = searchMode === 'hybrid' && !inTrash;
   if (hybrid) request.set('mode', 'hybrid');
@@ -88,12 +93,15 @@ function LibraryFiles() {
   if (project) request.set('project', project);
   if (tag) request.set('tag', tag);
   if (shelf !== 'all') request.set('shelf', shelf);
-  const matches = useRead<LibraryMatches>(inTrash || browsing || !searchTerm ? null : `/files/search?${request}`);
+  const matches = useRead<LibraryMatches>(
+    inTrash || browsing || activeQuery !== searchTerm ? null : `/files/search?${request}`);
   const items = list.value?.filter(item => (filter === 'all' || item.kind === filter) && (!directory || parentFolder(item.path) === directory)
     && (!format || item.format === format) && (!project || (item.projectIds ?? [item.projectId]).includes(project))
     && (!tag || item.tags?.some(entry => entry.key === tag))
     && (shelf === 'all' || (shelf === 'favorites' ? item.favorite : item.lastViewedAt)));
-  if (shelf === 'recent') items?.sort((left, right) => (right.lastViewedAt ?? '').localeCompare(left.lastViewedAt ?? ''));
+  if (shelf === 'recent') items?.sort((left, right) =>
+    (right.lastViewedOrder ?? 0) - (left.lastViewedOrder ?? 0)
+    || (right.lastViewedAt ?? '').localeCompare(left.lastViewedAt ?? ''));
   const tags = new Map(list.value?.flatMap(item => (item.tags ?? []).map(entry => [entry.key, entry.name] as const)));
   const selectedCount = Object.keys(picked).length;
   const { refresh: refreshList } = list;
@@ -164,8 +172,15 @@ function LibraryFiles() {
     });
   }
 
-  function setFileView(target: Record<string, string> = {}) {
-    setParams({ ...(directory && { folder: directory }), ...target });
+  function setFileView(target: Record<string, string | null> = {}) {
+    setParams(libraryFileParams(params, target));
+  }
+
+  function updateCondition(name: string, value: string) {
+    const next = new URLSearchParams(params);
+    if (value) next.set(name, value);
+    else next.delete(name);
+    setParams(next, { replace: true });
   }
 
   function showClassification(show: boolean) {
@@ -191,10 +206,27 @@ function LibraryFiles() {
     setFileView({ ...(fullFile && { open: '1' }), ...target });
   }
 
-  function imported(id: string) {
-    setFilter('all'); setFormat(''); setProject(''); setTag(''); setShelf('all'); setQuery(''); setSearchTerm('');
+  function finishReview(number: number, textRevision: string) {
     refreshFiles();
-    setParams({ file: id });
+    // A save can finish after the search or selected original page has changed.
+    const latest = parsePath(window.location.hash.slice(1));
+    if (latest.pathname !== pathname) return;
+    const current = new URLSearchParams(latest.search);
+    if (current.get('file') !== selected || current.get('at') !== at
+      || current.get('revision') !== revision || current.has('wiki')
+      || current.has('trash') || current.get('view') === 'graph') return;
+    setParams(libraryFileParams(current, {
+      file: selected, at: String(number), revision: textRevision, open: current.get('open'),
+    }));
+  }
+
+  function openCreatedFile(target: Record<string, string>) {
+    refreshFiles();
+    setFileView({ folder: null, kind: null, format: null, project: null, tag: null, shelf: null, q: null, ...target });
+  }
+
+  function imported(id: string) {
+    openCreatedFile({ file: id });
   }
 
   function rebuild() {
@@ -210,27 +242,33 @@ function LibraryFiles() {
     const hit = 'location' in item ? item : null;
     const pressed = selecting ? item.id in picked : selected === item.id && (hit?.location ? at === String(hit.location.number) : at === null);
     const Icon = selecting ? pressed ? SquareCheck : Square : FileText;
-    return <button className={`library-file ${pressed ? 'selected' : ''}`} aria-pressed={pressed} key={`${item.id}/${hit?.location?.number ?? 0}`}
-      disabled={selecting && !pressed && (item.status === 'missing' || selectedCount >= LIBRARY_BATCH_LIMIT)}
-      onDoubleClick={() => { if (!selecting && item.status !== 'missing') selectFile(item, true); }}
-      onClick={() => {
-        if (!selecting) selectFile(item);
-        else setPicked(current => {
-          if (!(item.id in current)) return { ...current, [item.id]: item.name };
-          const next = { ...current }; delete next[item.id]; return next;
-        });
-      }}>
-      <Icon size={18} /><span><strong>{item.name}{item.favorite && <Star className="library-favorite" size={13} aria-label="已收藏" />}</strong>
-        <small>{[FORMATS[item.format], item.projectTopic, STATUSES[item.status]].filter(Boolean).join(' · ')}</small>
-        {!!item.tags?.length && <small className="library-file-tags">{item.tags.map(entry => entry.name).join(' · ')}</small>}
-        {hit && <><small>{hit.location?.label ?? '文件信息'}
-          {hit.match === 'semantic' && ' · 语义相关'}{hit.match === 'both' && ' · 关键词及语义'}</small><span className="hit-excerpt">{hit.snippet}</span><small>{hit.path}</small></>}
-      </span>
-    </button>;
+    return <Fragment key={`${item.id}/${hit?.location?.number ?? 0}`}>
+      <button className={`library-file ${pressed ? 'selected' : ''}`} aria-pressed={pressed}
+        disabled={selecting && !pressed && (item.status === 'missing' || selectedCount >= LIBRARY_BATCH_LIMIT)}
+        onDoubleClick={() => { if (!selecting && item.status !== 'missing') selectFile(item, true); }}
+        onClick={() => {
+          if (!selecting) selectFile(item);
+          else setPicked(current => {
+            if (!(item.id in current)) return { ...current, [item.id]: item.name };
+            const next = { ...current }; delete next[item.id]; return next;
+          });
+        }}>
+        <Icon size={18} /><span><strong>{item.name}{item.favorite && <Star className="library-favorite" size={13} aria-label="已收藏" />}</strong>
+          <small>{[FORMATS[item.format], item.projectTopic, STATUSES[item.status]].filter(Boolean).join(' · ')}</small>
+          {!!item.tags?.length && <small className="library-file-tags">{item.tags.map(entry => entry.name).join(' · ')}</small>}
+          {hit && <><small>{hit.location?.label ?? '文件信息'}
+            {hit.match === 'semantic' && ' · 语义相关'}{hit.match === 'both' && ' · 关键词及语义'}</small><span className="hit-excerpt">{hit.snippet}</span><small>{hit.path}</small></>}
+        </span>
+      </button>
+      {!selecting && hit?.semanticExcerpt && <details className="library-semantic-excerpt">
+        <summary aria-label={`查看${item.name}${hit.location ? ' ' + hit.location.label : ''}的语义命中片段`}>语义命中片段</summary>
+        <p>{hit.semanticExcerpt}</p>
+      </details>}
+    </Fragment>;
   }
 
   function openTrash(id: string) {
-    setBatch(undefined); setSelecting(false); setPicked({}); setParams({ trash: id });
+    setBatch(undefined); setSelecting(false); setPicked({}); setFileView({ trash: id });
   }
 
   function prepareBatch(type: NonNullable<typeof batch>['action']) {
@@ -246,7 +284,7 @@ function LibraryFiles() {
 
   const folders = <div className="panel library-types"><h2>文件夹</h2>
     <LibraryFolderList entries={actualFolders} selected={inTrash ? '' : directory} onSelect={folder => {
-      setFilter('all'); refreshFiles(); setParams({ folder });
+      refreshFiles(); setFileView({ folder, kind: null });
     }} onCreate={!inTrash && directories.value ? () => setFolderAction('create') : undefined}
       onMove={!inTrash && currentFolder?.parent ? () => setFolderAction('move') : undefined} />
     <ErrorNote message={directories.error} retry={directories.refresh} />
@@ -254,7 +292,7 @@ function LibraryFiles() {
       {TYPES.map(({ key, label, icon: Icon }) => <button type="button" key={key}
         className={!inTrash && !directory && filter === key ? 'selected' : ''}
         aria-pressed={!inTrash && !directory && filter === key}
-        onClick={() => { setFilter(key); refreshFiles(); setParams({}); }}><Icon size={17} />{label}</button>)}
+        onClick={() => { refreshFiles(); setFileView({ folder: null, kind: key === 'all' ? null : key }); }}><Icon size={17} />{label}</button>)}
     </div>
     <button className={inTrash ? 'selected' : ''} aria-pressed={inTrash} onClick={() => openTrash('')}><Trash2 size={17} />回收站</button>
   </div>;
@@ -263,7 +301,7 @@ function LibraryFiles() {
     <div className="page-head"><div><h1>知识库</h1><p>查看和恢复已移入回收站的原件。</p></div></div>
     <LibraryViewSwitch />
     <div className="library-grid">{folders}<TrashPanel selected={params.get('trash') ?? ''}
-      onRestored={id => { setFilter('all'); setTag(''); setShelf('all'); setQuery(''); refreshFiles(); setParams({ file: id }); }} /></div>
+      onRestored={id => { refreshFiles(); setFileView({ folder: null, kind: null, tag: null, shelf: null, q: null, file: id }); }} /></div>
   </section>;
 
   return <section className="page library-page">
@@ -279,20 +317,20 @@ function LibraryFiles() {
     </div>
     <LibraryViewSwitch />
     {!fullFile && <><div className="library-toolbar">
-      <label className="search"><Search size={17} /><input type="search" aria-label="搜索知识库" placeholder="搜索文件名或正文" maxLength={120} value={query} onChange={event => setQuery(event.target.value)} /></label>
-      <select aria-label="搜索方式" value={searchMode} onChange={event => setSearchMode(event.target.value as typeof searchMode)}>
+      <label className="search"><Search size={17} /><input type="search" aria-label="搜索知识库" placeholder="搜索文件名或正文" maxLength={120} value={query} onChange={event => updateCondition('q', event.target.value)} /></label>
+      <select aria-label="搜索方式" value={searchMode} onChange={event => updateCondition('mode', event.target.value)}>
         <option value="keyword">关键词</option><option value="hybrid">关键词＋语义</option>
       </select>
-      <select aria-label="搜索范围" value={scope} onChange={event => setScope(event.target.value)}><option value="current">当前文件夹</option><option value="all">全部知识库</option></select>
-      <select aria-label="文件类型" value={format} onChange={event => setFormat(event.target.value)}><option value="">全部类型</option>{Object.entries(FORMATS).map(([value, name]) => <option key={value} value={value}>{name}</option>)}</select>
-      <select aria-label="学习项目" value={project} onChange={event => setProject(event.target.value)}><option value="">全部项目</option>{projectOptions.value?.map(item => <option key={item.id} value={item.id}>{item.topic}</option>)}</select>
-      <select aria-label="文件标签" value={tag} onChange={event => setTag(event.target.value)}>
+      <select aria-label="搜索范围" value={scope} onChange={event => updateCondition('scope', event.target.value)}><option value="current">当前文件夹</option><option value="all">全部知识库</option></select>
+      <select aria-label="文件类型" value={format} onChange={event => updateCondition('format', event.target.value)}><option value="">全部类型</option>{Object.entries(FORMATS).map(([value, name]) => <option key={value} value={value}>{name}</option>)}</select>
+      <select aria-label="学习项目" value={project} onChange={event => updateCondition('project', event.target.value)}><option value="">全部项目</option>{projectOptions.value?.map(item => <option key={item.id} value={item.id}>{item.topic}</option>)}</select>
+      <select aria-label="文件标签" value={tag} onChange={event => updateCondition('tag', event.target.value)}>
         <option value="">全部标签</option>
         {Array.from(tags.entries()).sort((a, b) => a[1].localeCompare(b[1], 'zh-CN')).map(([key, name]) => <option key={key} value={key}>{name}</option>)}
         {tag && !tags.has(tag) && <option value={tag}>{tag}</option>}
       </select>
       <select aria-label="文件视图" value={shelf} onChange={event => {
-        setShelf(event.target.value as FileShelf); refreshList(); refreshMatches();
+        updateCondition('shelf', event.target.value); refreshList(); refreshMatches();
       }}>
         <option value="all">所有文件</option><option value="favorites">收藏文件</option><option value="recent">最近访问</option>
       </select>
@@ -339,7 +377,7 @@ function LibraryFiles() {
         <h2>{browsing ? currentFolder?.name ?? '文件' : '搜索结果'}</h2>
         {!!directory && directories.value && !currentFolder && <ErrorNote message="该文件夹已移动或不存在，请在左侧重新选择。" />}
         {browsing ? items ? items.length ? items.map(fileButton) : <Empty title="没有匹配的文件" /> : <BackedStatus error={list.error} retry={list.refresh} />
-          : searchTerm !== query.trim() ? <Loading text="正在准备搜索" /> : matches.value ? <>
+          : searchTerm !== activeQuery ? <Loading text="正在准备搜索" /> : matches.value ? <>
             {matches.value.hits.length ? matches.value.hits.map(fileButton) : <Empty title="没有匹配的内容" />}
             {matches.value.hasMore && <p className="result-count">可缩小搜索范围以查看其余命中。</p>}
           </> : <BackedStatus error={matches.error} retry={matches.refresh} />}
@@ -359,10 +397,7 @@ function LibraryFiles() {
           keepFileLayout({ file: selected, ...(number === null ? {} : { at: String(number) }),
             ...(originalRevision ? { revision: originalRevision } : {}) });
         }}
-        onReviewed={(number, textRevision) => {
-          refreshFiles();
-          keepFileLayout({ file: selected, at: String(number), revision: textRevision });
-        }}
+        onReviewed={finishReview}
         onClose={() => setFileView()} onLatest={() => {
           refreshFiles();
           keepFileLayout({ file: selected });
@@ -370,9 +405,7 @@ function LibraryFiles() {
     </div>
     {creatingNote && <NewNoteDialog onClose={() => setCreatingNote(false)} onDone={note => {
       setCreatingNote(false);
-      setFilter('note'); setQuery(''); setSearchTerm(''); setFormat(''); setProject(''); setTag(''); setShelf('all');
-      refreshFiles();
-      setParams({ file: 'note-' + note.id, edit: '1' });
+      openCreatedFile({ kind: 'note', file: 'note-' + note.id, edit: '1' });
     }} />}
     {batch?.action === 'trash' && <MoveToTrash files={batch.files} onClose={() => setBatch(undefined)} onMoved={openTrash}
       onPartial={removeProcessed} />}
@@ -387,7 +420,7 @@ function LibraryFiles() {
       source={folderAction === 'move' && currentFolder ? currentFolder : undefined}
       onClose={() => setFolderAction(undefined)}
       onDone={path => {
-        setFolderAction(undefined); refreshFiles(); setParams({ folder: path });
+        setFolderAction(undefined); refreshFiles(); setFileView({ folder: path, kind: null });
       }} />}
     {classifying && <ClassificationRequest files={classifying} folders={actualFolders}
       close={() => setClassifying(undefined)} queued={() => { setClassifying(undefined); showClassification(true); }} />}
@@ -426,6 +459,7 @@ function PageRecognition({ id, page, revision, isPdf, anchor, onReviewed }: {
 }) {
   const action = useAction();
   const [draft, setDraft] = useState<OcrText & { baseTextRevision: string | null }>();
+  const [history, setHistory] = useState(false);
   const [externalPending, setExternalPending] = useState(false);
   const busy = action.pending || externalPending;
   const endpoint = `/files/${encodeURIComponent(id)}/pages/${page}/ocr`;
@@ -482,7 +516,13 @@ function PageRecognition({ id, page, revision, isPdf, anchor, onReviewed }: {
         onClick={() => setDraft({ text: anchor?.text ?? '', truncated: false, baseTextRevision })}>
         {anchor?.textRevision ? '编辑校对文字' : '手动录入'}
       </button>
+      <button type="button" className="text-action" disabled={busy} onClick={() => setHistory(true)}>校对版本</button>
     </div>}
+    {history && <OcrHistory fileId={id} initialPage={page} revision={revision} close={() => setHistory(false)}
+      restored={(number, textRevision) => {
+        setHistory(false);
+        onReviewed(number, textRevision);
+      }} />}
     <ErrorNote message={action.error} />
     <ExternalRecognition kind="ocr" description={isPdf ? `本次选择 PDF 第 ${page} 页` : '本次选择当前图片'}
       disabled={action.pending} replacesDraft={!!draft?.text.trim()} recognize={recognizeExternally} />
@@ -527,6 +567,7 @@ function FilePreview({ id, at, revision, full, onOpen, editing, onEdit, onPrevie
   const [moving, setMoving] = useState(false);
   const [tagging, setTagging] = useState(false);
   const [visitError, setVisitError] = useState(false);
+  const notifyViewed = useEffectEvent(onViewed);
   const anchor = useRef<HTMLDivElement>(null);
   const lastClassification = useRef(classificationRevision);
   const item = file.value;
@@ -549,12 +590,12 @@ function FilePreview({ id, at, revision, full, onOpen, editing, onEdit, onPrevie
     const controller = new AbortController();
     void api(`/files/${encodeURIComponent(id)}/opened`, 'POST', undefined, controller.signal).then(() => {
       setVisitError(false);
-      onViewed();
+      notifyViewed();
     }).catch(() => {
       if (!controller.signal.aborted) setVisitError(true);
     });
     return () => controller.abort();
-  }, [canOpen, id, onViewed]);
+  }, [canOpen, id]);
 
   function editedNote() {
     file.refresh();

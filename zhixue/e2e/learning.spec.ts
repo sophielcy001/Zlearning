@@ -1,10 +1,10 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { resolve, join } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { chromium, expect, test, type Browser, type Locator, type Page } from '@playwright/test';
 
@@ -1407,8 +1407,8 @@ test('model settings probe one local request and preserve independent roles acro
   }
 });
 
-test('verified course runs formal assessment, remediation, and learned Q&A consolidation', async ({ page }) => {
-  test.setTimeout(90000);
+test('verified course runs formal assessment, focused practice, remediation, and learned Q&A consolidation', async ({ page }) => {
+  test.setTimeout(110000);
   const folder = mkdtempSync(join(tmpdir(), 'zhixue-model-route-e2e-'));
   const prompts: string[] = [];
   const noteChecks: { model: string; prompt: string }[] = [];
@@ -1424,6 +1424,9 @@ test('verified course runs formal assessment, remediation, and learned Q&A conso
   const consolidationModels: string[] = [];
   let consolidationChecks = 0;
   const { promise: firstGradeGate, resolve: releaseFirstGrade } = Promise.withResolvers<void>();
+  const practicePrompts: string[] = [];
+  const practiceQuestion = '如何把合成资料的原句用于一条新的检查记录？';
+  const practiceAnswer = '专项作答：写下合成资料原句并说明检查依据。';
   const lessons = Array.from({ length: 8 }, (_, index) => ({
     key: `k${index}`, title: `昆曲知识点 ${index + 1}`, outcome: `完成曲牌练习 ${index + 1}`,
     prerequisites: index === 0 ? [] : [`k${index - 1}`], branch: null, required: true,
@@ -1436,7 +1439,10 @@ test('verified course runs formal assessment, remediation, and learned Q&A conso
       const input = JSON.parse(body);
       const prompt: string = input.messages[0].content;
       const verifyingNotes = prompt.includes('笔记核验 JSON');
+      const draftingPractice = prompt.startsWith('设计一组新的复习变式题');
+      const scoringPractice = prompt.startsWith('按每道题的标准评价整组答案') && prompt.includes(practiceAnswer);
       if (verifyingNotes) noteChecks.push({ model: input.model, prompt });
+      else if (draftingPractice || scoringPractice) practicePrompts.push(prompt);
       else prompts.push(prompt);
       const findings = {
         sections: [
@@ -1487,7 +1493,11 @@ test('verified course runs formal assessment, remediation, and learned Q&A conso
         { key: 'N1', verdict: 'supported', reason: '合成资料支持使用原句。', evidence: { section: 0, quote: evidence } },
         { key: 'N2', verdict: 'insufficient', reason: '资料缺少这项依据。', evidence: null },
       ] } : null;
-      const result = noteDecisions ?? addition ?? additionReview ?? answer ?? supplementalDraft ?? supplementalReview ?? (scoring ? grade : prompt.includes('拟定可独立检验') ? assessment
+      const originalGroup = assessment.objectives[0].group;
+      const practiceGroup = { ...originalGroup, questions: [{ ...originalGroup.questions[0], text: practiceQuestion }] };
+      const practiceGrade = { items: [grade.items[0]], explanation: '已完成独立的合成专项评价。' };
+      const result = noteDecisions ?? addition ?? additionReview ?? answer ?? supplementalDraft ?? supplementalReview
+        ?? (draftingPractice ? practiceGroup : scoringPractice ? practiceGrade : scoring ? grade : prompt.includes('拟定可独立检验') ? assessment
         : input.model === 'review-fixture' ? findings : prompt.includes('制定学习路线')
         ? { stages: [{ name: '曲牌基础', lessons: lessons.slice(0, 4) }, { name: '曲牌练习', lessons: lessons.slice(4) }] }
         : draft);
@@ -1769,6 +1779,58 @@ test('verified course runs formal assessment, remediation, and learned Q&A conso
     expect(prompts[3]).toContain(evidence);
     expect(prompts[3]).not.toContain('这段争议只供人工判断。');
     expect(prompts[7]).toContain('我使用选定的合成资料原句作为依据。');
+
+    const formalReviewUrl = page.url();
+    async function currentReviewAndReport() {
+      return page.evaluate(async () => {
+        const headers = { Authorization: 'Bearer ' + sessionStorage.getItem('zhixue-session') };
+        const paths = ['/api/reviews', '/api/study-report?period=month'];
+        const [reviews, report] = await Promise.all(paths.map(async path => {
+          const response = await fetch(path, { headers });
+          if (!response.ok) throw new Error('Cannot read formal progress');
+          return response.json();
+        }));
+        return { reviews: reviews.reviews, totals: report.totals.review, weak: report.weak };
+      });
+    }
+    const formalBaseline = await currentReviewAndReport();
+    await page.getByRole('link', { name: '学习报告', exact: true }).click();
+    await page.getByRole('button', { name: '月', exact: true }).click();
+    const monthUrl = page.url();
+    await page.getByRole('button', { name: '查看需要再练习的正式复习记录' }).click();
+    const records = page.getByRole('region', { name: '正式复习记录', exact: true });
+    const modelRecord = records.getByRole('listitem').filter({ hasText: '说明合成检查' });
+    await expect(modelRecord).toContainText('第 1 轮');
+    const original = modelRecord.getByRole('link', { name: '查看当轮评价' });
+    const reportWithFilter = page.url();
+    const linkedGroup = new URLSearchParams((await original.getAttribute('href'))?.split('?')[1]).get('group');
+    expect(linkedGroup).toBe(new URLSearchParams(new URL(formalReviewUrl).hash.split('?')[1]).get('group'));
+    await original.click();
+    await expect(page.getByRole('heading', { name: '需要再练习', exact: true })).toBeVisible();
+    expect(prompts).toHaveLength(10);
+    await expect(page.getByRole('link', { name: '返回学习报告', exact: true })).toBeVisible({ timeout: 4000 });
+    await page.getByRole('link', { name: '返回学习报告', exact: true }).click();
+    await expect(page).toHaveURL(reportWithFilter);
+    await expect(modelRecord).toBeVisible();
+    await page.goto(monthUrl);
+    await page.getByRole('link', { name: '专项练习 说明合成检查', exact: true }).click();
+    await page.getByText('来源评价与讲解', { exact: true }).click();
+    await expect(page.getByText('已完成合成的整组评价。', { exact: true })).toBeVisible();
+    await expect(supplementLink).toBeVisible();
+    expect(practicePrompts).toHaveLength(0);
+    await page.getByRole('button', { name: '生成专项练习', exact: true }).click();
+    await page.getByRole('textbox', { name: new RegExp(practiceQuestion.replace('？', '')) }).fill(practiceAnswer);
+    await page.getByRole('button', { name: '提交本组答案', exact: true }).click();
+    await expect(page.getByText('已完成独立的合成专项评价。', { exact: true })).toBeVisible({ timeout: 12000 });
+    expect(practicePrompts).toHaveLength(2);
+    expect(practicePrompts[0]).toContain('这个例子用了什么检查依据？');
+    expect(practicePrompts[0]).not.toContain('我使用选定的合成资料原句作为依据。');
+    await page.reload();
+    await expect(page.getByText('已完成独立的合成专项评价。', { exact: true })).toBeVisible({ timeout: 12000 });
+    await page.getByRole('link', { name: '返回学习报告', exact: true }).click();
+    await expect(page).toHaveURL(monthUrl);
+    expect(await currentReviewAndReport()).toEqual(formalBaseline);
+    await page.goto(formalReviewUrl);
 
     await supplementLink.click();
     await supplement.getByRole('button', { name: '关闭' }).click();
@@ -2746,6 +2808,104 @@ test('narrow layout keeps search, navigation, and text import usable', async ({ 
   }
 });
 
+test('knowledge library preserves search context through graph, full file, and reload', async ({ page }, info) => {
+  test.setTimeout(48000);
+  const folder = mkdtempSync(join(tmpdir(), 'zhixue-library-context-'));
+  const service = start(folder);
+  const query = '保留搜索上下文';
+  const body = '第二行记录如何保留搜索上下文。';
+  const filename = '上下文参考.txt';
+  try {
+    await page.setViewportSize({ width: 390, height: 1040 });
+    const origin = new URL(await service.url);
+    const key = new URLSearchParams(origin.hash.split('?')[1]).get('session');
+    const headers = { Authorization: 'Bearer ' + key };
+    async function api(path: string, method: string, data?: object) {
+      const response = await page.request.fetch(origin.origin + '/api' + path, { method, headers, data });
+      expect(response.ok()).toBeTruthy();
+      return response.json();
+    }
+
+    const project = await api('/projects', 'POST', {
+      id: '00000000-0000-4000-8000-000000000019', topic: 'SQLite 入门', outcome: '验证项目筛选可以续接',
+    });
+    const target = await api('/files', 'POST', { name: filename, content: '前言\n' + body });
+    await api('/files', 'POST', { name: '范围以外.txt', content: query + '的另一份资料' });
+    await api('/files/tags', 'POST', { ids: [target.id], tag: '核对', action: 'add' });
+    await api('/files/' + target.id + '/favorite', 'PUT', { favorite: true });
+    await page.goto(origin.href);
+    await page.evaluate(() => { window.location.hash = '#/library?folder=library%2Fimports'; });
+    const search = page.getByRole('searchbox', { name: '搜索知识库' });
+    const mode = page.getByRole('combobox', { name: '搜索方式' });
+    const scope = page.getByRole('combobox', { name: '搜索范围' });
+    const type = page.getByRole('combobox', { name: '文件类型' });
+    const tag = page.getByRole('combobox', { name: '文件标签' });
+    const shelf = page.getByRole('combobox', { name: '文件视图' });
+    await mode.selectOption('hybrid');
+    await scope.selectOption('all');
+    await type.selectOption('txt');
+    await tag.selectOption({ label: '核对' });
+    await shelf.selectOption('favorites');
+    await search.fill(query);
+    const visibleNames = page.locator('.library-list .library-file strong');
+    const file = page.getByRole('button', { name: /上下文参考\.txt.*第 2 行/ });
+    await expect(file).toBeVisible();
+    await expect(visibleNames).toHaveText([filename]);
+
+    const views = page.getByRole('navigation', { name: '知识库视图' });
+    await views.getByRole('link', { name: '图谱', exact: true }).click();
+    await expect(views.getByRole('link', { name: '图谱', exact: true })).toHaveAttribute('aria-current', 'page');
+    await views.getByRole('link', { name: '文件', exact: true }).click();
+    async function expectSearch() {
+      await expect(search).toHaveValue(query);
+      await expect(mode).toHaveValue('hybrid');
+      await expect(scope).toHaveValue('all');
+      await expect(type).toHaveValue('txt');
+      await expect(tag).toHaveValue('核对');
+      await expect(shelf).toHaveValue('favorites');
+      await expect(visibleNames).toHaveText([filename]);
+      expect(new URLSearchParams(new URL(page.url()).hash.split('?')[1]).get('folder')).toBe('library/imports');
+    }
+    await expectSearch();
+
+    await file.dblclick();
+    await expect(page.getByRole('button', { name: '返回文件列表' })).toBeVisible();
+    await expect(page.locator('.file-anchor')).toContainText(body);
+    const anchored = new URLSearchParams(new URL(page.url()).hash.split('?')[1]);
+    expect(anchored.get('at')).toBe('2');
+    expect(anchored.get('revision')).toBeTruthy();
+    await page.reload();
+    await expect(page.locator('.file-anchor')).toContainText(body);
+    await page.getByRole('button', { name: '返回文件列表' }).click();
+    await expectSearch();
+    await page.reload();
+    await expectSearch();
+    const filters = page.locator('.library-toolbar');
+    await filters.evaluate(node => node.scrollIntoView({ block: 'center' }));
+    await filters.screenshot({ path: info.outputPath('检索条件恢复.png') });
+
+    const category = page.locator('.library-types-list').getByRole('button', { name: '导入资料', exact: true });
+    await category.click();
+    await scope.selectOption('current');
+    const projectFilter = page.getByRole('combobox', { name: '学习项目' });
+    await projectFilter.selectOption(project.id);
+    await expect(page.getByText('没有匹配的内容', { exact: true })).toBeVisible();
+    await views.getByRole('link', { name: '图谱', exact: true }).click();
+    await views.getByRole('link', { name: '文件', exact: true }).click();
+    await expect(projectFilter).toHaveValue(project.id);
+    await expect(category).toHaveAttribute('aria-pressed', 'true');
+    await expect(scope).toHaveValue('current');
+    await expect(search).toHaveValue(query);
+  } finally {
+    await stop(service.child);
+    const fixture = realpathSync(folder);
+    if (dirname(fixture) !== realpathSync(tmpdir()) || !fixture.split(/[\\/]/).at(-1)?.startsWith('zhixue-library-context-')) {
+      throw new Error('Unexpected library search fixture directory');
+    }
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
 test('knowledge library imports a PDF, filters content hits, opens its original page, and can reuse a duplicate', async ({ page }) => {
   const folder = mkdtempSync(join(tmpdir(), 'zhixue-library-'));
   const service = start(folder);
@@ -2789,6 +2949,114 @@ test('knowledge library imports a PDF, filters content hits, opens its original 
   }
 });
 
+test('knowledge library expands the complete local semantic hit and opens its pinned source line', async ({ page }, info) => {
+  const assets = process.env.ZHIXUE_TEST_SEMANTIC_ASSETS;
+  if (!assets) {
+    test.skip(true, 'Requires the pinned local semantic model files');
+    return;
+  }
+  test.setTimeout(65000);
+  const folder = mkdtempSync(join(tmpdir(), 'zhixue-semantic-excerpt-'));
+  let service: ReturnType<typeof start> | undefined;
+  const context = 'Before looking up the answer, open the appendix and locate the examples. The glossary explains the representation used throughout the document. Each example shows a different operation. ';
+  const lastSentence = 'Chunk long documents into overlapping passages before indexing.';
+  const query = 'how to split long documents into overlapping sections';
+  try {
+    const model = join(folder, '.semantic', 'multilingual-e5-small');
+    mkdirSync(model, { recursive: true });
+    for (const name of ['model_quantized.onnx', 'tokenizer.json']) {
+      copyFileSync(join(assets, name), join(model, name));
+    }
+    service = start(folder);
+    await page.setViewportSize({ width: 390, height: 840 });
+    await page.goto(await service.url);
+    await page.getByRole('link', { name: '知识库', exact: true }).click();
+    await page.getByLabel('导入资料').setInputFiles({
+      name: '长文.txt', mimeType: 'text/plain', buffer: Buffer.from('前言\n' + context + lastSentence),
+    });
+    await expect(page.getByRole('heading', { name: '长文.txt' })).toBeVisible();
+    await page.getByRole('combobox', { name: '搜索方式' }).selectOption('hybrid');
+    await page.getByRole('button', { name: '启用语义搜索', exact: true }).click();
+    await page.getByRole('searchbox', { name: '搜索知识库' }).fill(query);
+    const hit = page.getByRole('button', { name: /长文\.txt.*第 2 行.*语义相关/ });
+    await expect(hit).toBeVisible({ timeout: 16000 });
+    await expect(hit.locator('.hit-excerpt')).not.toContainText(lastSentence);
+    const disclosure = page.getByLabel('查看长文.txt 第 2 行的语义命中片段', { exact: true });
+    const previous = page.url();
+    await expect(disclosure).toBeVisible({ timeout: 4000 });
+    await disclosure.focus();
+    await page.keyboard.press('Enter');
+    await expect(disclosure.locator('..').getByText(context + lastSentence, { exact: true })).toBeVisible();
+    await expect(page).toHaveURL(previous);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+    await disclosure.locator('..').screenshot({ path: info.outputPath('完整语义命中片段.png') });
+
+    await hit.click();
+    await expect(page.locator('.file-anchor')).toContainText(lastSentence);
+    const location = new URLSearchParams(new URL(page.url()).hash.split('?')[1]);
+    expect(location.get('at')).toBe('2');
+    expect(location.get('revision')).toBeTruthy();
+
+    await stop(service.child);
+    service = undefined;
+    const cache = join(folder, '.semantic', 'e5-small-v1.sqlite3');
+    writeFileSync(cache, 'Invalid index data '.repeat(240));
+    service = start(folder);
+    await page.goto(await service.url);
+    await page.getByRole('link', { name: '知识库', exact: true }).click();
+    await page.getByRole('combobox', { name: '搜索方式' }).selectOption('hybrid');
+    await expect(page.getByText('本地语义检索暂时不可用。请重试语义索引。')).toBeVisible();
+    await page.getByRole('searchbox', { name: '搜索知识库' }).fill('appendix and locate the examples');
+    await expect(page.getByRole('button', { name: /长文\.txt.*第 2 行/ })).toBeVisible();
+    await page.getByRole('button', { name: '重建索引', exact: true }).click();
+    await expect(page.getByText('索引已重建', { exact: true })).toBeVisible();
+    await page.getByRole('searchbox', { name: '搜索知识库' }).fill(query);
+    await expect(hit).toBeVisible({ timeout: 22000 });
+    await expect(disclosure).toBeVisible();
+    await disclosure.click();
+    await expect(disclosure.locator('..').getByText(context + lastSentence, { exact: true })).toBeVisible();
+
+    const literalName = query + '.txt';
+    const isVisit = (request: { method(): string; url(): string }) =>
+      request.method() === 'POST' && /\/api\/files\/[^/]+\/opened$/.test(request.url());
+    const firstVisit = page.waitForResponse(response => isVisit(response.request()) && response.ok());
+    await page.getByLabel('导入资料').setInputFiles({
+      name: literalName, mimeType: 'text/plain', buffer: Buffer.from(' \n'),
+    });
+    await expect(page.getByRole('heading', { name: literalName, exact: true })).toBeVisible();
+    await firstVisit;
+    const fileView = page.getByRole('combobox', { name: '文件视图' });
+    const resultTitles = page.locator('.library-list .library-file strong');
+    const visits: string[] = [];
+    const trackVisit = (request: { method(): string; url(): string }) => {
+      if (isVisit(request)) visits.push(new URL(request.url()).pathname);
+    };
+    page.on('request', trackVisit);
+    await fileView.selectOption('recent');
+    await page.getByRole('searchbox', { name: '搜索知识库' }).fill(query);
+    await expect(resultTitles).toHaveText([literalName, '长文.txt']);
+    expect(visits).toEqual([]);
+
+    const readAgain = page.waitForResponse(response => isVisit(response.request()) && response.ok());
+    await hit.click();
+    await readAgain;
+    await expect(resultTitles).toHaveText(['长文.txt', literalName]);
+    await expect(page.locator('.file-anchor')).toContainText(lastSentence);
+    await page.locator('.library-list').screenshot({ path: info.outputPath('最近访问混合排序.png') });
+    await fileView.selectOption('all');
+    await expect(resultTitles).toHaveText([literalName, '长文.txt']);
+    expect(visits).toHaveLength(1);
+    page.off('request', trackVisit);
+  } finally {
+    if (service) await stop(service.child);
+    const fixture = realpathSync(folder);
+    if (dirname(fixture) !== realpathSync(tmpdir()) || !fixture.split(/[\\/]/).at(-1)?.startsWith('zhixue-semantic-excerpt-')) {
+      throw new Error('Unexpected semantic search fixture directory');
+    }
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
 test('knowledge library repairs a copied file only after confirming the candidate preview', async ({ page }) => {
   const folder = mkdtempSync(join(tmpdir(), 'zhixue-library-repair-'));
   const service = start(folder);
@@ -2826,7 +3094,7 @@ test('knowledge library repairs a copied file only after confirming the candidat
   }
 });
 
-test('knowledge library trashes, restores beside an occupied path, and only purges after confirmation', async ({ page }) => {
+test('knowledge library trashes, restores beside an occupied path, and only purges after confirmation', async ({ page }, info) => {
   const folder = mkdtempSync(join(tmpdir(), 'zhixue-library-trash-'));
   const service = start(folder);
   try {
@@ -2839,6 +3107,24 @@ test('knowledge library trashes, restores beside an occupied path, and only purg
     const activeUrl = page.url();
     const identity = new URLSearchParams(new URL(activeUrl).hash.split('?')[1]).get('file');
     const old = join(folder, 'library', 'imports', `${identity}.txt`);
+    const address = new URL(await service.url);
+    const token = new URLSearchParams(address.hash.split('?')[1]).get('session');
+    const authored = await page.request.post(address.origin + '/api/files', {
+      headers: { Authorization: 'Bearer ' + token },
+      data: {
+        name: '引用回收原件.md',
+        content: '此处参考 [[' + identity + '|回收站练习]] 和 [[library/imports/' + identity + '.txt|旧路径引用]]。',
+      },
+    });
+    expect(authored.ok()).toBeTruthy();
+    await page.getByRole('button', { name: '移入回收站', exact: true }).click();
+    const review = page.getByRole('dialog', { name: '移入回收站' });
+    await review.getByText('1 份文件通过双链引用此原件', { exact: true }).click();
+    await expect(review.getByText('引用回收原件.md', { exact: true })).toBeVisible();
+    await expect(review.getByText('1 处原文位置', { exact: true })).toBeVisible();
+    await review.screenshot({ path: info.outputPath('回收站双链影响.png') });
+    await review.getByRole('button', { name: '取消' }).click();
+    expect(readFileSync(old, 'utf8')).toBe('恢复后引用的原件内容。');
     const deleteFile = async () => {
       await page.getByRole('button', { name: '移入回收站', exact: true }).click();
       const confirm = page.getByRole('dialog', { name: '移入回收站' });
@@ -2847,7 +3133,28 @@ test('knowledge library trashes, restores beside an occupied path, and only purg
     };
 
     await deleteFile();
-    writeFileSync(old, '占用原路径的新内容。');
+    const wikiSource = (await authored.json()).id as string;
+    const sourceUrl = address.origin + '/#/library?' + new URLSearchParams({ file: wikiSource });
+    const preview = page.locator('.library-preview');
+    const originalLink = preview.getByRole('link', { name: '[[旧路径引用]]', exact: true });
+    await page.goto(sourceUrl);
+    await originalLink.click();
+    await expect(preview.getByText('文件已移入知识库回收站。', { exact: true })).toBeVisible();
+    const other = await page.request.post(address.origin + '/api/files/upload?name=作为占用者的普通文件.txt', {
+      headers: { Authorization: 'Bearer ' + token }, data: '占用原路径的新内容。',
+    });
+    expect(other.ok()).toBeTruthy();
+    const replacement = (await other.json()).id as string;
+    const occupiedSource = join(folder, 'library', 'imports', replacement + '.txt');
+    renameSync(occupiedSource, old);
+    await page.goto(sourceUrl);
+    await originalLink.click();
+    const archivedChoice = preview.locator('.wiki-options').getByRole('link').filter({ hasText: '已移入回收站' });
+    await expect(archivedChoice).toBeVisible();
+    await expect(preview.locator('.wiki-options').getByRole('link')).toHaveCount(2);
+    await preview.screenshot({ path: info.outputPath('回收站双链候选.png') });
+    await archivedChoice.click();
+    await preview.getByRole('button', { name: '查看回收站', exact: true }).click();
     await page.getByRole('button', { name: '恢复文件', exact: true }).click();
     const transfer = page.getByRole('dialog', { name: '恢复文件' });
     await transfer.getByRole('button', { name: '确认恢复' }).click();
@@ -2858,6 +3165,12 @@ test('knowledge library trashes, restores beside an occupied path, and only purg
     await expect(page.getByText('恢复后引用的原件内容。', { exact: true })).toBeVisible();
     expect(readFileSync(old, 'utf8')).toBe('占用原路径的新内容。');
     expect(page.url()).toBe(activeUrl);
+    await preview.getByText('反向链接', { exact: true }).click();
+    await preview.getByRole('link', { name: '引用回收原件.md · 第 1 行' }).click();
+    await expect(preview.locator('.file-anchor')).toContainText('此处参考');
+    await originalLink.click();
+    await preview.locator('.wiki-options').getByRole('link').filter({ hasText: '恢复的资料.txt' }).click();
+    await expect(preview.getByRole('heading', { name: '恢复的资料.txt' })).toBeVisible();
 
     await deleteFile();
     await page.getByRole('button', { name: '手动清理' }).click();
@@ -2869,6 +3182,57 @@ test('knowledge library trashes, restores beside an occupied path, and only purg
     await expect(page.getByText('回收站为空')).toBeVisible();
     await page.goto(activeUrl);
     await expect(page.getByText('回收站原件已清理。学习记录与引用仍保留。')).toBeVisible();
+  } finally {
+    await stop(service.child);
+    rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+
+test('knowledge library reviews an unchanged trash original after its file identity changes', async ({ page }, info) => {
+  const folder = mkdtempSync(join(tmpdir(), 'zhixue-trash-identity-review-'));
+  const service = start(folder);
+  try {
+    const address = new URL(await service.url);
+    await page.goto(address.href);
+    const token = new URLSearchParams(address.hash.split('?')[1]).get('session');
+    const headers = { Authorization: 'Bearer ' + token };
+    const body = '旧版换机后保留的回收原件。';
+    const imported = await page.request.post(address.origin + '/api/files/upload?name=换机资料.txt', { headers, data: body });
+    expect(imported.ok()).toBeTruthy();
+    const { id } = await imported.json();
+    const response = await page.request.get(address.origin + '/api/files/' + id, { headers });
+    expect(response.ok()).toBeTruthy();
+    const { path, revision } = await response.json();
+    const trashed = await page.request.post(address.origin + '/api/files/' + id + '/trash', { headers, data: { path, revision } });
+    expect(trashed.ok()).toBeTruthy();
+    const entry = await trashed.json();
+    const archived = join(folder, entry.archivePath);
+    const copied = join(dirname(archived), 'copied.txt');
+    writeFileSync(copied, body);
+    renameSync(copied, archived);
+    await page.evaluate(trash => { window.location.hash = '#/library?' + new URLSearchParams({ trash }); }, entry.id);
+    await page.getByRole('button', { name: '恢复文件', exact: true }).click();
+    const dialog = page.getByRole('dialog', { name: '恢复文件' });
+    await dialog.getByLabel('恢复位置').fill('library/imports/换机找回.txt');
+    await dialog.getByRole('button', { name: '确认恢复', exact: true }).click();
+    await expect(dialog.getByText('当前内容与回收记录的版本一致。', { exact: false })).toBeVisible();
+    await dialog.screenshot({ path: info.outputPath('换机回收原件核对.png') });
+    await dialog.getByRole('button', { name: '取消', exact: true }).click();
+    expect(readFileSync(archived, 'utf8')).toBe(body);
+    await page.getByRole('button', { name: '恢复文件', exact: true }).click();
+    await dialog.getByLabel('恢复位置').fill('library/imports/换机找回.txt');
+    await dialog.getByRole('button', { name: '确认恢复', exact: true }).click();
+    await expect(dialog.getByRole('button', { name: '按核对版本恢复' })).toBeVisible();
+    await dialog.getByLabel('恢复位置').fill('library/imports/确认的新位置.txt');
+    await expect(dialog.getByRole('button', { name: '按核对版本恢复' })).toHaveCount(0);
+    await dialog.getByRole('button', { name: '确认恢复', exact: true }).click();
+    await dialog.getByRole('button', { name: '按核对版本恢复' }).click();
+    await expect(page.getByRole('heading', { name: '确认的新位置.txt' })).toBeVisible();
+    await expect(page.getByText(body, { exact: true })).toBeVisible();
+    expect(new URLSearchParams(new URL(page.url()).hash.split('?')[1]).get('file')).toBe(id);
+    const restored = await page.request.get(address.origin + '/api/files/' + id, { headers });
+    expect((await restored.json()).revision).toBe(revision);
   } finally {
     await stop(service.child);
     rmSync(folder, { recursive: true, force: true });
@@ -2891,12 +3255,18 @@ test('batch trash shows a stale file separately and requires a fresh preview to 
     }
     const first = await add('批量甲.txt');
     const second = await add('批量乙.txt');
+    await page.getByLabel('导入资料').setInputFiles({
+      name: '批量引用说明.md', mimeType: 'text/markdown', buffer: Buffer.from('优先保留 [[批量乙]]。'),
+    });
+    await expect(page.getByRole('heading', { name: '批量引用说明.md' })).toBeVisible();
     await page.getByRole('button', { name: '多选文件' }).click();
     await page.getByRole('button', { name: /批量甲\.txt/ }).click();
     await page.getByRole('button', { name: /批量乙\.txt/ }).click();
     await page.getByRole('button', { name: '移入回收站 · 2 项' }).click();
     const dialog = page.getByRole('dialog', { name: '移入回收站' });
     await expect(dialog.getByRole('button', { name: '确认移入 2 个文件' })).toBeEnabled();
+    await dialog.getByText('1 份文件通过双链引用此原件', { exact: true }).click();
+    await expect(dialog.getByText('批量引用说明.md', { exact: true })).toBeVisible();
     writeFileSync(second, '确认期间的外部更新');
     await dialog.getByRole('button', { name: '确认移入 2 个文件' }).click();
     await expect(dialog.getByText('已移入回收站', { exact: true })).toBeVisible();
@@ -3076,7 +3446,325 @@ test('dragging a review previews the reflow and a confirmed lock survives restar
   }
 });
 
-test('study report connects activity timers with daily totals, corrections, and formal review outcomes', async ({ page }) => {
+test('study report locates a missed course booking and refreshes its forecast after release', async ({ page }) => {
+  const folder = mkdtempSync(join(tmpdir(), 'zhixue-prediction-lock-'));
+  const service = start(folder);
+  try {
+    const url = new URL(await service.url);
+    const token = new URLSearchParams(url.hash.split('?')[1]).get('session');
+    const headers = { Authorization: 'Bearer ' + token };
+    async function request(path: string, method = 'GET', data?: object) {
+      const response = await page.request.fetch(url.origin + '/api' + path, { headers, method, data });
+      expect(response.ok(), await response.text()).toBeTruthy();
+      return response.json();
+    }
+    await page.setViewportSize({ width: 390, height: 820 });
+    await page.goto(url.href);
+    const project = await request('/projects', 'POST', {
+      id: '00000000-0000-4000-8000-000000000261', topic: 'SQLite 入门', outcome: '修正一次错过的课程预约',
+    });
+    await expect.poll(async () => (await request('/projects/' + project.id)).task.status, { timeout: 12000 }).toBe('ready');
+    const plan = await request('/study-plan');
+    const task = plan.days[0].tasks[0];
+    const requestMove = { taskId: task.id, placement: { date: plan.today, start: task.start } };
+    const preview = await request('/study-plan/moves/preview', 'POST', requestMove);
+    expect(preview.confirmation).toBeTruthy();
+    await request('/study-plan/moves/confirm', 'POST', { ...requestMove, confirmation: preview.confirmation });
+    await request('/demo/next-day', 'POST');
+    await page.goto(new URL('/#/study-report?period=month', url).href);
+
+    await expect(page.getByText('先处理锁定任务', { exact: true })).toBeVisible();
+    await expect(page.getByText(/已过计划日期/)).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+    await page.getByRole('link', { name: '查看预约 ' + task.title, exact: true }).click();
+    const pending = page.locator('[id="study-lock-' + task.id + '"]');
+    await expect(pending).toBeFocused();
+    await expect(pending.getByText('已过计划日期', { exact: true })).toBeVisible();
+    const release = pending.getByRole('button', { name: '解除锁定 ' + task.title, exact: true });
+    await release.click();
+    const dialog = page.getByRole('dialog', { name: '解除锁定', exact: true });
+    await dialog.getByRole('button', { name: '取消', exact: true }).click();
+    await expect(pending).toBeVisible();
+    expect((await request('/study-plan')).pendingLocks[0].id).toBe(task.id);
+
+    await release.click();
+    await dialog.getByRole('button', { name: '确认解除锁定', exact: true }).click();
+    await expect(page.getByRole('status').filter({ hasText: '已解除锁定。' })).toBeVisible();
+    await page.goBack();
+    await expect(page.getByRole('heading', { name: '课程完成预估', exact: true })).toBeVisible();
+    expect(new URL(page.url()).hash).toBe('#/study-report?period=month');
+    await expect(page.getByText(/使用默认估时/)).toBeVisible();
+    await expect(page.getByRole('link', { name: '查看预约 ' + task.title, exact: true })).toHaveCount(0);
+  } finally {
+    await stop(service.child);
+    const verified = realpathSync(folder);
+    if (isAbsolute(relative(realpathSync(tmpdir()), verified)) || dirname(verified) !== realpathSync(tmpdir())
+        || !verified.split(/[\\/]/).at(-1)?.startsWith('zhixue-prediction-lock-')) {
+      throw new Error('Unexpected prediction fixture directory');
+    }
+    rmSync(verified, { recursive: true, force: true });
+  }
+});
+
+test('study report separates plan coverage and compares reading time with date detail', async ({ page }) => {
+  const folder = mkdtempSync(join(tmpdir(), 'zhixue-report-comparison-'));
+  const clockFile = join(folder, 'clock.txt');
+  const date = (instant: string) => writeFileSync(clockFile, instant);
+  date('2027-01-25T08:00:00');
+  const service = start(folder, clockFile);
+  try {
+    const url = new URL(await service.url);
+    const token = new URLSearchParams(url.hash.split('?')[1]).get('session');
+    const headers = { Authorization: 'Bearer ' + token };
+    async function request(path: string, method = 'GET', data?: object) {
+      const response = await page.request.fetch(url.origin + '/api' + path, { headers, method, data });
+      expect(response.ok(), await response.text()).toBeTruthy();
+      return response.json();
+    }
+    const project = await request('/projects', 'POST', {
+      id: '00000000-0000-4000-8000-000000000279', topic: 'SQLite 入门', outcome: '复盘有计划与无计划日期的学习时长',
+    });
+    await expect.poll(async () => (await request('/projects/' + project.id)).task.status, { timeout: 12000 }).toBe('ready');
+
+    async function readLesson(index: number, from: string, until: string) {
+      date(from);
+      const lessonId = project.lessons[index].id;
+      const started = await request('/timer', 'POST', { action: 'start', lessonId });
+      date(until);
+      await request('/timer', 'POST', { action: 'finish', timerId: started.active.id });
+      await request('/lessons/' + lessonId + '/learned', 'PUT', { learned: true });
+      return started.active.id;
+    }
+
+    await readLesson(0, '2027-01-25T08:00:00', '2027-01-25T08:08:00');
+    await readLesson(1, '2027-01-27T08:00:00', '2027-01-27T08:20:00');
+    const current = await readLesson(2, '2027-02-01T08:00:00', '2027-02-01T08:06:00');
+    date('2027-02-01T15:55:00');
+    const note = await request('/timer', 'POST', { action: 'start', category: 'notes', lessonId: project.lessons[2].id });
+    date('2027-02-01T16:05:00');
+    await request('/timer', 'POST', { action: 'finish', timerId: note.active.id });
+
+    await page.setViewportSize({ width: 390, height: 820 });
+    await page.goto(url.href);
+    await page.getByRole('link', { name: '学习报告', exact: true }).click();
+    const comparison = page.locator('.report-columns section').filter({ has: page.getByRole('heading', { name: '计划与实际', exact: true }) });
+    const metric = (label: string) => comparison.getByText(label, { exact: true }).locator('..').locator('dd');
+    await expect(comparison.getByText('所选日期中 1 / 2 天有计划记录。')).toBeVisible();
+    await expect(metric('有计划日期的确认时长')).toHaveText('11 分钟');
+    await expect(metric('无计划记录日期的确认时长')).toHaveText('5 分钟');
+    await expect(metric('上一周期（2027.01.25 至 2027.01.26） · 1 个知识点')).toHaveText('8 分钟');
+    await expect(metric('较上一周期')).toHaveText('缩短 2 分钟');
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+
+    await page.getByRole('link', { name: '查看 2027.02.02 日报', exact: true }).click();
+    await expect(page).toHaveURL(/#\/study-report\?period=day&on=2027-02-02$/);
+    await expect(comparison.getByText('这个时段还没有保存的计划估时。')).toBeVisible();
+    await expect(metric('无计划记录日期的确认时长')).toHaveText('5 分钟');
+    await expect(page.getByRole('link', { name: '查看 2027.02.02 日报', exact: true })).toHaveCount(0);
+    await page.goBack();
+    await expect(page.getByRole('button', { name: '周', exact: true })).toHaveAttribute('aria-pressed', 'true');
+    await expect(metric('较上一周期')).toHaveText('缩短 2 分钟');
+
+    const correction = '/study-report/timers/' + current + '/correction';
+    const fields = { sourceOn: '2027-02-01', reportOn: '2027-02-01', category: 'learning' };
+    await request(correction, 'PUT', { ...fields, seconds: 600, baseRevision: 0 });
+    await page.reload();
+    await expect(metric('较上一周期')).toHaveText('增加 2 分钟');
+    await request(correction, 'PUT', { ...fields, seconds: 480, baseRevision: 1 });
+    await page.reload();
+    await expect(metric('较上一周期')).toHaveText('持平');
+    await page.getByRole('button', { name: '月', exact: true }).click();
+    await expect(metric('上一周期（2027.01.01 至 2027.01.02） · 0 个知识点')).toHaveText('暂无可比计时');
+    await expect(metric('较上一周期')).toHaveCount(0);
+  } finally {
+    await stop(service.child);
+    const verified = realpathSync(folder);
+    if (dirname(verified) !== realpathSync(tmpdir()) || !verified.split(/[\\/]/).at(-1)?.startsWith('zhixue-report-comparison-')) {
+      throw new Error('Unexpected report fixture directory');
+    }
+    rmSync(verified, { recursive: true, force: true });
+  }
+});
+
+test('study report previews correction history and safely reuses the original after a conflict', async ({ page }) => {
+  const folder = mkdtempSync(join(tmpdir(), 'zhixue-timer-history-'));
+  const clockFile = join(folder, 'clock.txt');
+  writeFileSync(clockFile, '2027-02-01T08:00:00');
+  const service = start(folder, clockFile);
+  try {
+    const url = new URL(await service.url);
+    const token = new URLSearchParams(url.hash.split('?')[1]).get('session');
+    const headers = { Authorization: 'Bearer ' + token };
+    async function request(path: string, method = 'GET', data?: object) {
+      const response = await page.request.fetch(url.origin + '/api' + path, { headers, method, data });
+      expect(response.ok(), await response.text()).toBeTruthy();
+      return response.json();
+    }
+    const project = await request('/projects', 'POST', {
+      id: '00000000-0000-4000-8000-000000000289', topic: 'SQLite 入门', outcome: '核对计时校正的各个版本',
+    });
+    await expect.poll(async () => (await request('/projects/' + project.id)).task.status, { timeout: 12000 }).toBe('ready');
+    const lesson = project.lessons[0];
+    const startTimer = await request('/timer', 'POST', { action: 'start', lessonId: lesson.id, category: 'learning' });
+    const timerId = startTimer.active.id;
+    writeFileSync(clockFile, '2027-02-01T08:02:00');
+    await request('/timer', 'POST', { action: 'finish', timerId });
+    const path = '/study-report/timers/' + timerId;
+    const day = { sourceOn: '2027-02-01', reportOn: '2027-02-01' };
+    await request(path + '/correction', 'PUT', { ...day, seconds: 60, category: 'notes', baseRevision: 0 });
+    await request(path + '/correction', 'PUT', { ...day, seconds: 90, category: 'assistant', baseRevision: 1 });
+
+    await page.setViewportSize({ width: 390, height: 820 });
+    await page.goto(url.href);
+    await page.getByRole('link', { name: '学习报告', exact: true }).click();
+    const records = page.getByText('已确认计时记录（1）', { exact: true });
+    await records.click();
+    const edit = page.getByRole('button', { name: '校正 ' + lesson.title + ' 2027-02-01', exact: true });
+    const timerEditor = page.getByRole('dialog', { name: '校正计时', exact: true });
+    const openHistory = () => timerEditor.getByRole('button', { name: '查看校正历史', exact: true }).click();
+    const version = timerEditor.getByRole('combobox', { name: '校正版本' });
+    const load = () => timerEditor.getByRole('button', { name: '载入此版本', exact: true }).click();
+    const commit = () => timerEditor.getByRole('button', { name: '保存校正', exact: true }).click();
+    await edit.click();
+    await openHistory();
+    await expect(version).toHaveValue('2');
+    await version.selectOption('1');
+    await expect(timerEditor.getByText('2027.02.01 · 笔记 · 1 分钟', { exact: true })).toBeVisible();
+    await load();
+    await expect(timerEditor.getByLabel('有效分钟')).toBeFocused();
+    await expect(timerEditor.getByLabel('活动类别')).toHaveValue('notes');
+    await timerEditor.getByRole('button', { name: '取消', exact: true }).click();
+    await expect(page.getByText('1 分钟 30 秒 · 原始 2 分钟', { exact: true })).toBeVisible();
+
+    await edit.click();
+    await openHistory();
+    await version.selectOption('0');
+    await load();
+    await expect(timerEditor.getByLabel('有效分钟')).toHaveValue('2');
+    await request(path + '/correction', 'PUT', { ...day, seconds: 30, category: 'notes', baseRevision: 2 });
+    await commit();
+    await expect(timerEditor.getByRole('alert').filter({ hasText: '此计时已校正' })).toBeVisible();
+    await expect(timerEditor.getByLabel('有效分钟')).toHaveValue('2');
+
+    await openHistory();
+    await expect(version).toHaveValue('3');
+    await version.selectOption('0');
+    await load();
+    await commit();
+    await expect(page.getByRole('status').filter({ hasText: '计时校正已保存。' })).toBeVisible();
+    await expect(page.getByText('2 分钟 · 原始 2 分钟', { exact: true })).toBeVisible();
+    const history = await request(path + '/corrections?sourceOn=2027-02-01');
+    expect(history.versions.map((entry: { revision: number }) => entry.revision)).toEqual([4, 3, 2, 1, 0]);
+    expect((await request('/timer')).lastSaved.elapsed).toBe(120);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  } finally {
+    await stop(service.child);
+    const verified = realpathSync(folder);
+    if (dirname(verified) !== realpathSync(tmpdir()) || !verified.split(/[\\/]/).at(-1)?.startsWith('zhixue-timer-history-')) {
+      throw new Error('Unexpected timer history fixture directory');
+    }
+    rmSync(verified, { recursive: true, force: true });
+  }
+});
+
+test('study report filters long timer lists from activity totals without changing totals', async ({ page }) => {
+  const folder = mkdtempSync(join(tmpdir(), 'zhixue-timer-filters-'));
+  const clockFile = join(folder, 'clock.txt');
+  const clock = new Date('2027-02-01T08:00:00Z');
+  const writeClock = () => writeFileSync(clockFile, clock.toISOString().slice(0, 19));
+  writeClock();
+  const service = start(folder, clockFile);
+  try {
+    const url = new URL(await service.url);
+    const token = new URLSearchParams(url.hash.split('?')[1]).get('session');
+    const headers = { Authorization: 'Bearer ' + token };
+    async function request(path: string, method = 'GET', data?: object) {
+      const response = await page.request.fetch(url.origin + '/api' + path, { headers, method, data });
+      expect(response.ok(), await response.text()).toBeTruthy();
+      return response.json();
+    }
+
+    const topics = ['SQLite 入门', 'SQLite 索引回顾'];
+    const projects = [];
+    for (const [index, topic] of topics.entries()) {
+      const id = index === 0 ? '00000000-0000-4000-8000-000000000297' : '00000000-0000-4000-8000-000000000298';
+      const project = await request('/projects', 'POST', { id, topic, outcome: '查找学习计时明细' });
+      projects.push(project);
+      await expect.poll(async () => (await request('/projects/' + project.id)).task.status, { timeout: 12000 }).toBe('ready');
+    }
+    async function record(lessonId: string, category: 'notes' | 'assistant') {
+      const timer = await request('/timer', 'POST', { action: 'start', lessonId, category });
+      clock.setUTCSeconds(clock.getUTCSeconds() + 60);
+      writeClock();
+      await request('/timer', 'POST', { action: 'finish', timerId: timer.active.id });
+    }
+    for (let index = 0; index < 22; index++) await record(projects[0].lessons[0].id, 'notes');
+    await record(projects[1].lessons[0].id, 'assistant');
+    execFileSync(python, ['-c', [
+      'import sqlite3, sys',
+      'from contextlib import closing',
+      'with closing(sqlite3.connect(sys.argv[1])) as db, db:',
+      '    db.execute("INSERT INTO timers (id, lesson_id, status, elapsed, updated_at) VALUES (?, ?, ?, ?, ?)",',
+      '               ("00000000-0000-4000-8000-000000000299", sys.argv[2], "finished", 90, "2027-02-01 08:30:00"))',
+    ].join('\n'), join(folder, 'zhixue.sqlite3'), projects[1].lessons[0].id], { windowsHide: true });
+
+    await page.setViewportSize({ width: 390, height: 820 });
+    await page.goto(new URL('/#/study-report?period=month&session=' + token, url).href);
+    const overview = page.locator('.report-summary section').filter({ has: page.getByRole('heading', { name: '学习时长', exact: true }) });
+    await expect(overview.getByText('23 分钟', { exact: true })).toBeVisible();
+    await overview.getByRole('button', { name: '查看笔记计时记录', exact: true }).click();
+    const records = page.getByRole('region', { name: '计时记录', exact: true });
+    const activity = records.getByRole('combobox', { name: /活动类别/ });
+    const search = records.getByRole('searchbox', { name: '搜索课程或项目' });
+    const confirmed = records.locator('details').first();
+    const rows = confirmed.getByRole('listitem');
+    await expect(activity).toHaveValue('notes');
+    await expect(activity).toBeFocused();
+    await expect(confirmed.getByText('已确认计时记录（22）', { exact: true })).toBeVisible();
+    await expect(rows).toHaveCount(20);
+    await confirmed.getByRole('button', { name: '显示更多计时记录', exact: true }).click();
+    await expect(rows).toHaveCount(22);
+
+    await search.fill('索引回顾');
+    await expect(confirmed.getByText('没有符合筛选条件的计时记录。')).toBeVisible();
+    await activity.selectOption('assistant');
+    await expect(rows).toHaveCount(1);
+    await expect(rows.first().getByText(/SQLite 索引回顾/)).toBeVisible();
+    await page.reload();
+    await expect(activity).toHaveValue('assistant');
+    await expect(search).toHaveValue('索引回顾');
+    await expect(rows).toHaveCount(1);
+    await rows.first().getByRole('button', { name: /^校正 / }).click();
+    const editor = page.getByRole('dialog', { name: '校正计时', exact: true });
+    await expect(editor.getByText(/SQLite 索引回顾 · 原始计时 1 分钟/)).toBeVisible();
+    await editor.getByRole('button', { name: '取消', exact: true }).click();
+    await activity.selectOption('unclassified');
+    await expect(confirmed.getByText('已确认计时记录（0）')).toBeVisible();
+    const undated = records.locator('details').nth(1);
+    await expect(undated.getByText('日期待补录的旧计时（1）', { exact: true })).toBeVisible();
+    const legacy = undated.getByRole('listitem');
+    await expect(legacy).toHaveCount(1);
+    await expect(legacy.getByText(/SQLite 索引回顾 · 日期待补录/)).toBeVisible();
+    await legacy.getByRole('button', { name: /旧计时$/ }).click();
+    await expect(editor.getByLabel('归入日期')).toHaveValue('');
+    await editor.getByRole('button', { name: '取消', exact: true }).click();
+    await records.getByRole('button', { name: '清除筛选', exact: true }).click();
+    await expect(activity).toHaveValue('');
+    await expect(confirmed.getByText('已确认计时记录（23）', { exact: true })).toBeVisible();
+    await expect(rows).toHaveCount(20);
+    await expect(overview.getByText('23 分钟', { exact: true })).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  } finally {
+    await stop(service.child);
+    const verified = realpathSync(folder);
+    if (dirname(verified) !== realpathSync(tmpdir()) || !verified.split(/[\\/]/).at(-1)?.startsWith('zhixue-timer-filters-')) {
+      throw new Error('Unexpected timer filters fixture directory');
+    }
+    rmSync(verified, { recursive: true, force: true });
+  }
+});
+
+test('study report connects activity timers with daily totals, corrections, and formal review outcomes', async ({ page }, info) => {
   const folder = mkdtempSync(join(tmpdir(), 'zhixue-study-report-'));
   const service = start(folder);
   try {
@@ -3135,12 +3823,39 @@ test('study report connects activity timers with daily totals, corrections, and 
     await page.getByRole('button', { name: '日', exact: true }).click();
     const review = page.locator('section').filter({ has: page.getByRole('heading', { name: '正式复习表现', exact: true }) })
       .filter({ hasNot: page.getByRole('heading', { name: '学习报告', exact: true }) });
-    await expect(review.getByText('辅助作答', { exact: true }).locator('..').locator('dd')).toHaveText('1');
-    await expect(review.getByText('独立通过', { exact: true }).locator('..').locator('dd')).toHaveText('0');
-    await expect(review.getByText('未评分', { exact: true }).locator('..').locator('dd')).toHaveText('0');
+    for (const [label, count] of [['辅助作答', '1'], ['独立通过', '0'], ['未评分', '0']]) {
+      const category = review.getByRole('button', { name: '查看' + label + '的正式复习记录' });
+      await expect(category.locator('../..').locator('dd')).toHaveText(count);
+    }
     await expect(page.getByRole('link', { name: '复习课程 区分行与列' })).toBeVisible();
+    const viewport = page.viewportSize()!;
+    await page.setViewportSize({ width: 390, height: 800 });
+    await review.getByRole('button', { name: '查看辅助作答的正式复习记录' }).click();
+    const records = page.getByRole('region', { name: '正式复习记录', exact: true });
+    const outcome = records.getByRole('combobox', { name: '复习结果' });
+    await expect(outcome).toHaveValue('hinted');
+    await expect(outcome).toBeFocused();
+    const row = records.getByRole('listitem');
+    await expect(row).toHaveCount(1);
+    await expect(row).toContainText('区分行与列');
+    await expect(row).toContainText('第 1 轮');
+    await expect(row.getByRole('link', { name: '理解表、行和列' })).toHaveAttribute('href', '#/lessons/' + lesson);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+    await page.reload();
+    await expect(outcome).toBeVisible();
+    await expect(outcome).toHaveValue('hinted');
+    await expect(row).toHaveCount(1);
+    await records.screenshot({ path: info.outputPath('正式复习记录.png') });
+    await outcome.selectOption('ungraded');
+    await expect(records.getByText('本周期没有符合筛选条件的正式复习记录。')).toBeVisible();
+    await outcome.selectOption('');
+    await expect(row).toHaveCount(1);
+    await outcome.selectOption('hinted');
+    await page.setViewportSize(viewport);
 
     await page.getByRole('button', { name: '上一周期' }).click();
+    await expect(outcome).toHaveValue('hinted');
+    await expect(records.getByText('本周期没有符合筛选条件的正式复习记录。')).toBeVisible();
     await page.getByText('已确认计时记录（1）', { exact: true }).click();
     await expect(page.getByText(/· 笔记$/)).toBeVisible();
     await page.getByRole('button', { name: `校正 ${project.lessons[0].title}` }).click();
@@ -3318,6 +4033,63 @@ test('a fixed lesson appears at its appointment and snoozes without starting a t
   } finally {
     await stop(service.child);
     rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+test('a rebooked fixed lesson shows a fresh reminder in the same window', async ({ page }) => {
+  const folder = mkdtempSync(join(tmpdir(), 'zhixue-rebooked-reminder-'));
+  const clockFile = join(folder, 'clock.txt');
+  writeFileSync(clockFile, '2027-02-01T11:00:00');
+  const service = start(folder, clockFile);
+  try {
+    const url = new URL(await service.url);
+    const token = new URLSearchParams(url.hash.split('?')[1]).get('session');
+    const headers = { Authorization: 'Bearer ' + token };
+    async function request(path: string, method = 'GET', data?: object) {
+      const response = await page.request.fetch(url.origin + '/api' + path, { headers, method, data });
+      expect(response.ok(), await response.text()).toBeTruthy();
+      return response.json();
+    }
+    const project = await request('/projects', 'POST', {
+      id: '00000000-0000-4000-8000-000000000269', topic: 'SQLite 入门', outcome: '重新预约后获得新的固定课程提醒',
+    });
+    await expect.poll(async () => (await request('/projects/' + project.id)).task.status, { timeout: 12000 }).toBe('ready');
+    const plan = await request('/study-plan');
+    const task = plan.days[0].tasks[0];
+    const movement = { taskId: task.id, placement: { date: plan.today, start: '19:00' } };
+    const initial = await request('/study-plan/moves/preview', 'POST', movement);
+    await request('/study-plan/moves/confirm', 'POST', { ...movement, confirmation: initial.confirmation });
+
+    await page.clock.install({ time: new Date('2027-02-01T11:00:00Z') });
+    await page.goto(url.href);
+    const originalPage = await page.evaluate(() => performance.timeOrigin);
+    const fixed = page.getByRole('region', { name: '固定课程提醒 ' + task.title, exact: true });
+    await fixed.getByRole('button', { name: '关闭提醒', exact: true }).click();
+    await expect(fixed).toHaveCount(0);
+    await page.getByRole('link', { name: '今日任务', exact: true }).click();
+    await page.getByRole('button', { name: '解除锁定 ' + task.title, exact: true }).click();
+    await page.getByRole('button', { name: '确认解除锁定', exact: true }).click();
+    await expect(page.getByText('已解除锁定。', { exact: true })).toBeVisible();
+    await expect(fixed).toHaveCount(0);
+
+    await page.getByRole('button', { name: '改期 ' + task.title, exact: true }).click();
+    const dialog = page.getByRole('dialog', { name: '调整排期', exact: true });
+    await expect(dialog.getByLabel('目标日期', { exact: true })).toHaveValue(plan.today);
+    await dialog.getByLabel('开始时间', { exact: true }).fill('19:00');
+    await dialog.getByRole('button', { name: '预览改期', exact: true }).click();
+    await dialog.getByRole('button', { name: '确认并锁定', exact: true }).click();
+    await expect(fixed).toBeVisible();
+    expect(await page.evaluate(() => performance.timeOrigin)).toBe(originalPage);
+    await fixed.getByRole('link', { name: '打开预约课程', exact: true }).click();
+    await expect(page).toHaveURL(new RegExp('#/lessons/' + task.lessonId + '$'));
+    expect((await request('/timer')).active).toBeNull();
+  } finally {
+    await stop(service.child);
+    const verified = realpathSync(folder);
+    if (dirname(verified) !== realpathSync(tmpdir()) || !verified.split(/[\\/]/).at(-1)?.startsWith('zhixue-rebooked-reminder-')) {
+      throw new Error('Unexpected rebooking fixture directory');
+    }
+    rmSync(verified, { recursive: true, force: true });
   }
 });
 
@@ -3883,7 +4655,21 @@ test('prerequisite backup resumes the saved draft after its shared call limit is
   }
 });
 
+async function holdSecondPageOcrSave(page: Page) {
+  const path = '**/api/files/*/pages/2/ocr';
+  const { promise: started, resolve: markStarted } = Promise.withResolvers<void>();
+  const { promise: released, resolve: release } = Promise.withResolvers<void>();
+  await page.route(path, async route => {
+    if (route.request().method() !== 'PUT') return route.fallback();
+    markStarted();
+    await released;
+    await route.continue();
+  });
+  return { started, release, stop: () => page.unroute(path) };
+}
+
 test('knowledge library reviews real local OCR and opens a confirmed hit on the scanned page', async ({ page }) => {
+  test.setTimeout(90000);
   const folder = mkdtempSync(join(tmpdir(), 'zhixue-library-ocr-'));
   const service = start(folder);
   try {
@@ -3922,7 +4708,8 @@ test('knowledge library reviews real local OCR and opens a confirmed hit on the 
     const original = page.getByRole('img', { name: 'PDF 原件第 1 页' });
     await expect.poll(() => original.evaluate(image => (image as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
     await page.reload();
-    await expect(page.getByText('人工校对 搜索定位 2026', { exact: true })).toBeVisible();
+    await expect(search).toHaveValue('搜索定位');
+    await expect(page.locator('.library-preview .file-anchor')).toContainText('人工校对 搜索定位 2026');
 
     const fileId = new URLSearchParams(new URL(page.url()).hash.split('?')[1]).get('file');
     expect(fileId).toBeTruthy();
@@ -3955,11 +4742,29 @@ test('knowledge library reviews real local OCR and opens a confirmed hit on the 
     const latest = await page.request.get(revisionPath.href, { headers });
     expect((await latest.json()).anchor.text).toBe(otherText);
     await editor.getByRole('button', { name: '取消', exact: true }).click();
+    await page.evaluate(id => { location.hash = '/library/?file=' + id + '&at=1'; }, fileId);
+    await expect(preview.locator('.file-anchor')).toContainText(otherText);
     await editor.getByRole('button', { name: '编辑校对文字' }).click();
     await expect(draft).toHaveValue(otherText);
+    expect(new URL(page.url()).hash.split('?')[0]).toBe('#/library/');
     await draft.fill('对照新版重新校对完成');
     await editor.getByRole('button', { name: '保存校对文字' }).click();
     await expect(preview.locator('.file-anchor')).toContainText('对照新版重新校对完成');
+
+    await editor.getByRole('button', { name: '校对版本', exact: true }).click();
+    const history = page.getByRole('dialog', { name: '校对版本', exact: true });
+    await expect(history.getByRole('combobox', { name: '选择校对版本' }).locator('option')).toHaveCount(3);
+    await history.getByRole('combobox', { name: '选择校对版本' }).selectOption(first.anchor.textRevision);
+    await expect(history.getByLabel('版本差异')).toContainText('+人工校对 搜索定位 2026');
+    await expect(history.getByLabel('版本差异')).toContainText('-对照新版重新校对完成');
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(410);
+    await history.getByRole('button', { name: '恢复此校对版本', exact: true }).click();
+    await expect(history).toBeHidden();
+    await expect(preview.locator('.file-anchor')).toContainText('人工校对 搜索定位 2026');
+    await page.reload();
+    await expect(preview.locator('.file-anchor')).toContainText('人工校对 搜索定位 2026');
+    await search.fill('搜索定位');
+    await expect(page.getByRole('button', { name: /扫描复习\.pdf.*第 1 页 · 已校对 OCR/ })).toBeVisible();
 
     await page.getByRole('button', { name: '下一页' }).click();
     await expect(page.getByRole('img', { name: 'PDF 原件第 2 页' })).toBeVisible();
@@ -3967,6 +4772,70 @@ test('knowledge library reviews real local OCR and opens a confirmed hit on the 
     await expect(page.getByRole('alert')).toContainText('本页未识别到文字');
     await page.getByRole('button', { name: '手动录入' }).click();
     await expect(page.getByRole('textbox', { name: '校对文字' })).toBeEditable();
+
+    await draft.fill('旧第二页独有的历史校对');
+    await editor.getByRole('button', { name: '保存校对文字' }).click();
+    await expect(preview.locator('.file-anchor')).toContainText('旧第二页独有的历史校对');
+    const secondPath = new URL('/api/files/' + fileId + '?at=2', page.url()).href;
+    const second = await (await page.request.get(secondPath, { headers })).json();
+    await editor.getByRole('button', { name: '编辑校对文字' }).click();
+    await draft.fill('第二页重新确认的文字');
+    await editor.getByRole('button', { name: '保存校对文字' }).click();
+    await expect(preview.locator('.file-anchor')).toContainText('第二页重新确认的文字');
+
+    await page.getByRole('button', { name: '上一页' }).click();
+    await expect(page.getByRole('img', { name: 'PDF 原件第 1 页' })).toBeVisible();
+    await editor.getByRole('button', { name: '校对版本', exact: true }).click();
+    await history.getByRole('combobox', { name: '选择校对页', exact: true }).selectOption('2', { timeout: 15000 });
+    await history.getByRole('combobox', { name: '选择校对版本', exact: true }).selectOption(second.anchor.textRevision);
+    await expect(history.getByLabel('版本差异')).toContainText('+旧第二页独有的历史校对');
+    await history.getByRole('button', { name: '恢复此校对版本', exact: true }).click();
+    await expect(history).toBeHidden();
+    await expect(page.getByRole('img', { name: 'PDF 原件第 2 页' })).toBeVisible();
+    await expect(preview.locator('.file-anchor')).toContainText('旧第二页独有的历史校对');
+
+    const lateText = '已离开页面后的新校对';
+    await search.fill(lateText);
+    await expect(page.getByText('没有匹配的内容')).toBeVisible();
+    const heldSave = await holdSecondPageOcrSave(page);
+    await editor.getByRole('button', { name: '编辑校对文字' }).click();
+    await draft.fill(lateText);
+    await editor.getByRole('button', { name: '保存校对文字' }).click();
+    try {
+      await heldSave.started;
+      await page.getByRole('button', { name: '上一页' }).click();
+      await expect(original).toBeVisible();
+    } finally {
+      heldSave.release();
+    }
+    const lateHit = page.getByRole('button', { name: /扫描复习\.pdf.*第 2 页 · 已校对 OCR/ });
+    await expect(lateHit).toBeVisible();
+    await expect(original).toBeVisible();
+    await expect(search).toHaveValue(lateText);
+    await heldSave.stop();
+    await lateHit.click();
+    await expect(preview.locator('.file-anchor')).toContainText(lateText);
+
+    const replacement = execFileSync(resolve(python), ['-c', [
+      'import pymupdf, sys',
+      'with pymupdf.open(stream=sys.stdin.buffer.read(), filetype="pdf") as previous, pymupdf.open() as current:',
+      '    current.insert_pdf(previous, from_page=0, to_page=0)',
+      '    sys.stdout.buffer.write(current.tobytes())',
+    ].join('\n')], { input: source });
+    const disk = realpathSync(resolve(folder, first.path));
+    const inside = relative(realpathSync(folder), disk);
+    expect(inside && !inside.startsWith('..') && !isAbsolute(inside)).toBe(true);
+    writeFileSync(disk, replacement);
+    await page.evaluate(id => { location.hash = '/library?file=' + id + '&at=1'; }, fileId);
+    await expect(page.getByRole('button', { name: '下一页' })).toBeDisabled();
+    await editor.getByRole('button', { name: '校对版本', exact: true }).click();
+    const pages = history.getByRole('combobox', { name: '选择校对页', exact: true });
+    await expect(pages.getByRole('option', { name: '第 2 页 · 仅历史', exact: true })).toHaveCount(1);
+    await pages.selectOption('2');
+    await history.getByRole('combobox', { name: '选择校对版本', exact: true }).selectOption(second.anchor.textRevision);
+    await expect(history.getByText('当前原件已没有第 2 页，可查看历史校对。', { exact: true })).toBeVisible();
+    await expect(history.getByText('旧第二页独有的历史校对', { exact: true })).toBeVisible();
+    await expect(history.getByRole('button', { name: '恢复此校对版本', exact: true })).toHaveCount(0);
   } finally {
     await stop(service.child);
     rmSync(folder, { recursive: true, force: true });
@@ -4092,10 +4961,27 @@ test('external recognition asks separately for the recording and selected page b
     const search = page.getByRole('searchbox', { name: '搜索知识库' });
     await search.fill('外部单页识别草稿');
     await expect(page.getByText('没有匹配的内容')).toBeVisible();
-    await draft.fill('校对后可搜索的文字');
+    const reviewText = '校对后可搜索的文字';
+    const term = '校对后可搜索';
+    const heldSave = await holdSecondPageOcrSave(page);
+    await draft.fill(reviewText);
     await ocr.getByRole('button', { name: '保存校对文字' }).click();
-    await expect(page.getByText('校对后可搜索的文字', { exact: true })).toBeVisible();
-    await search.fill('校对后可搜索');
+    try {
+      await heldSave.started;
+      await search.fill(term);
+      await page.getByRole('combobox', { name: '搜索范围' }).selectOption('all');
+      await expect.poll(() => page.evaluate(() => {
+        const params = new URLSearchParams(location.hash.split('?')[1]);
+        return [params.get('q'), params.get('scope')];
+      })).toEqual([term, 'all']);
+    } finally {
+      heldSave.release();
+    }
+    await expect(draft).toHaveCount(0);
+    await expect(page.locator('.file-anchor')).toContainText(reviewText);
+    await expect(search).toHaveValue(term);
+    await expect(page.getByRole('combobox', { name: '搜索范围' })).toHaveValue('all');
+    await heldSave.stop();
     await page.getByRole('button', { name: /外部识别扫描\.pdf.*第 2 页 · 已校对 OCR/ }).click();
     await expect(original).toBeVisible();
     await page.reload();
@@ -4162,6 +5048,15 @@ test('records speech locally, releases the microphone, and inserts only reviewed
       const original = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
       const streams: MediaStreamTrack[] = [];
       Object.defineProperty(window, 'voiceTestTracks', { value: streams });
+      const addModule = AudioWorklet.prototype.addModule;
+      let holdOpening = true;
+      AudioWorklet.prototype.addModule = async function (...args) {
+        if (holdOpening) {
+          holdOpening = false;
+          await new Promise<void>(resolve => { Reflect.set(window, 'resumeVoiceWorklet', resolve); });
+        }
+        return addModule.apply(this, args);
+      };
       navigator.mediaDevices.getUserMedia = async constraints => {
         const stream = await original(constraints);
         streams.push(...stream.getTracks());
@@ -4177,12 +5072,30 @@ test('records speech locally, releases the microphone, and inserts only reviewed
     const microphone = page.getByRole('button', { name: '学习问题语音输入' });
     const dialog = page.getByRole('dialog', { name: '录音转文字' });
     await microphone.click();
-    await dialog.getByRole('button', { name: '开始录音' }).click();
+    const startRecording = dialog.getByRole('button', { name: '开始录音' });
+    await startRecording.click();
+    await expect(dialog.getByText('正在打开麦克风')).toBeVisible();
+    await expect.poll(() => page.evaluate(() => typeof Reflect.get(window, 'resumeVoiceWorklet'))).toBe('function');
+    const disconnected = await page.evaluate(() => {
+      const [track] = Reflect.get(window, 'voiceTestTracks') as MediaStreamTrack[];
+      const previous = track.readyState;
+      track.stop();
+      track.dispatchEvent(new Event('ended'));
+      Reflect.get(window, 'resumeVoiceWorklet')();
+      return [previous, track.readyState];
+    });
+    expect(disconnected).toEqual(['live', 'ended']);
+    await expect(dialog.getByText('麦克风已断开，请重新录音。')).toBeVisible();
+    await expect(startRecording).toBeEnabled();
+    expect(transcripts).toBe(0);
+    await expect(input).toHaveValue('我想学习数据库');
+
+    await startRecording.click();
     await expect(dialog.getByText('正在录音', { exact: true })).toBeVisible();
     await dialog.getByRole('button', { name: '取消' }).click();
     await expect(dialog).toHaveCount(0);
     await expect.poll(() => page.evaluate(() => Reflect.get(window, 'voiceTestTracks')
-      .map((track: MediaStreamTrack) => track.readyState))).toEqual(['ended']);
+      .map((track: MediaStreamTrack) => track.readyState))).toEqual(['ended', 'ended']);
     expect(transcripts).toBe(0);
     await expect(input).toHaveValue('我想学习数据库');
 
@@ -4195,7 +5108,7 @@ test('records speech locally, releases the microphone, and inserts only reviewed
     const draft = dialog.getByRole('textbox', { name: '语音草稿' });
     await expect(draft).toHaveValue(/fellow Americans/i, { timeout: 12000 });
     await expect.poll(() => page.evaluate(() => Reflect.get(window, 'voiceTestTracks')
-      .map((track: MediaStreamTrack) => track.readyState))).toEqual(['ended', 'ended']);
+      .map((track: MediaStreamTrack) => track.readyState))).toEqual(['ended', 'ended', 'ended']);
     await draft.fill('我希望能够理解数据库如何检索。');
     await dialog.getByRole('button', { name: '填入文字' }).click();
     await expect(input).toHaveValue('我想学习数据库\n我希望能够理解数据库如何检索。');
@@ -4294,6 +5207,90 @@ raise SystemExit(launch.main())
   }
 });
 
+test('knowledge library preserves search context across wiki links and backlinks', async ({ page }, info) => {
+  test.setTimeout(50_000);
+  const folder = mkdtempSync(join(tmpdir(), 'zhixue-wiki-context-'));
+  const service = start(folder);
+  const query = '续接导航样本';
+  const searchParams = { q: query, folder: 'library/imports', format: 'md', scope: 'all' };
+  try {
+    const origin = new URL(await service.url);
+    const key = new URLSearchParams(origin.hash.split('?')[1]).get('session');
+    const headers = { Authorization: 'Bearer ' + key };
+    async function importMarkdown(name: string, content: string) {
+      const response = await page.request.post(origin.origin + '/api/files', { headers, data: { name, content } });
+      expect(response.ok()).toBeTruthy();
+      return (await response.json()).id as string;
+    }
+
+    const target = await importMarkdown('参考入口.md', '# 参考段落\n\n定义在这里。');
+    const first = await importMarkdown('双份材料.md', '# 甲版材料');
+    await importMarkdown('双份材料.md', '# 乙版材料');
+    const targetBody = await page.request.get(origin.origin + '/api/files/' + target, { headers });
+    expect(targetBody.ok()).toBeTruthy();
+    const revision = (await targetBody.json()).revision as string;
+    const direct = '#/library?' + new URLSearchParams({ file: target, at: '3', revision });
+    const source = await importMarkdown('导航原文.md',
+      '# 导航原文\n\n' + query + ' [[参考入口]]、[[双份材料]]，再读[定义原文](' + direct + ')。');
+    await page.goto(origin.href);
+    await page.evaluate(params => { window.location.hash = '#/library?' + new URLSearchParams(params); }, searchParams);
+
+    const preview = page.locator('.library-preview');
+    const search = page.getByRole('searchbox', { name: '搜索知识库' });
+    const getParams = () => new URLSearchParams(new URL(page.url()).hash.split('?')[1]);
+    async function expectSearch() {
+      await expect(search).toHaveValue(query);
+      const current = getParams();
+      for (const [name, value] of Object.entries(searchParams)) expect(current.get(name)).toBe(value);
+    }
+
+    await page.getByRole('button', { name: /导航原文\.md.*第 3 行/ }).click();
+    await expect(preview.locator('.file-anchor')).toContainText(query);
+    const sourceRevision = getParams().get('revision');
+    expect(sourceRevision).toBeTruthy();
+    await preview.getByRole('link', { name: '[[参考入口]]', exact: true }).click();
+    await expect(preview.getByRole('heading', { name: '参考段落', exact: true })).toBeVisible();
+    await expectSearch();
+    expect(getParams().get('file')).toBe(target);
+    expect(getParams().get('at')).toBeNull();
+    expect(getParams().get('revision')).toBeNull();
+
+    await preview.getByText('反向链接', { exact: true }).click();
+    await preview.getByRole('link', { name: '导航原文.md · 第 3 行' }).click();
+    await expect(preview.locator('.file-anchor')).toContainText(query);
+    await expectSearch();
+    expect(getParams().get('file')).toBe(source);
+    expect(getParams().get('at')).toBe('3');
+    expect(getParams().get('revision')).toBe(sourceRevision);
+
+    await preview.getByRole('link', { name: '[[双份材料]]', exact: true }).click();
+    await expect(preview.getByText('有多个文件匹配「双份材料」。请选择要打开的文件。')).toBeVisible();
+    await expectSearch();
+    await preview.getByRole('link', { name: new RegExp(first) }).click();
+    await expect(preview.getByRole('heading', { name: '甲版材料' })).toBeVisible();
+    await expectSearch();
+
+    await page.goBack();
+    await preview.getByRole('link', { name: '定义原文', exact: true }).click();
+    await expect(preview.locator('.file-anchor')).toContainText('定义在这里。');
+    await expectSearch();
+    expect(getParams().get('file')).toBe(target);
+    expect(getParams().get('at')).toBe('3');
+    expect(getParams().get('revision')).toBe(revision);
+    await page.reload();
+    await expect(preview.locator('.file-anchor')).toContainText('定义在这里。');
+    await expectSearch();
+    await page.screenshot({ path: info.outputPath('双链与原文定位.png'), fullPage: true });
+  } finally {
+    await stop(service.child);
+    const fixture = realpathSync(folder);
+    if (dirname(fixture) !== realpathSync(tmpdir()) || !fixture.split(/[\\/]/).at(-1)?.startsWith('zhixue-wiki-context-')) {
+      throw new Error('Unexpected wiki test fixture path');
+    }
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
 test('wiki links complete in both note editors and return to the exact source line', async ({ page }) => {
   test.setTimeout(65_000);
   const folder = mkdtempSync(join(tmpdir(), 'zhixue-wiki-'));
@@ -4324,7 +5321,8 @@ test('wiki links complete in both note editors and return to the exact source li
     writeFileSync(join(folder, 'library', 'courses', lesson + '.md'),
       '# 课程互链测试\n\n每次查询前看 [[' + card + '|随身卡]]。\n\n`' + literal + '` 是代码。\n');
 
-    await page.goto(address.replace('#/?', '#/library?file=' + note + '&edit=1&'));
+    const search = page.getByRole('searchbox', { name: '搜索知识库' });
+    await page.goto(address.replace('#/?', '#/library?file=' + note + '&edit=1&q=wiki-context&'));
     const preview = page.locator('.library-preview');
     const editor = preview.getByRole('textbox', { name: '笔记正文' });
     await expect(editor).toBeEditable();
@@ -4378,6 +5376,7 @@ test('wiki links complete in both note editors and return to the exact source li
     await preview.getByRole('button', { name: '富文本' }).click();
     await editor.getByRole('link', { name: '[[查询随身卡.txt]]' }).click();
     await expect(preview.getByRole('heading', { name: '查询随身卡.txt' })).toBeVisible();
+    await expect(search).toHaveValue('wiki-context');
 
     await preview.getByText('反向链接', { exact: true }).click();
     await expect(preview.locator('.wiki-backlinks a')).toHaveCount(2);

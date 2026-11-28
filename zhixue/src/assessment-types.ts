@@ -35,5 +35,8 @@ export type RemediationCard = {
   courseVersion: number; round: number; scoredOn: string; sourcesChanged: boolean; citations: Citation[];
   entries: { index: number; question: string; cause: string; explanation: string; reason: string }[];
 };
-export type AssessmentDetail = Review & { round: number; group: AssessmentGroup | null; latest: AssessmentGroup | null };
+export type AssessmentDetail = Review & {
+  round: number; group: AssessmentGroup | null; latest: AssessmentGroup | null;
+  focus?: AssessmentGroup; focusIssue?: string | null;
+};
 export const abilityName = { recall: '回忆与理解', apply: '应用', analyze: '分析' };

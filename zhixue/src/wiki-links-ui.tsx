@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import type { WikiBacklink, WikiResolution, WikiTarget } from './api';
+import { libraryFileUrl } from './library-views';
 import { BackedStatus, Empty, Loading, useRead } from './shared';
 import type { WikiDraft } from './wiki-markdown';
 
@@ -8,8 +9,12 @@ const kinds: Record<WikiTarget['kind'], string> = {
   course: '课程', note: '笔记', import: '导入资料', supplement: '补充讲解',
 };
 
+const targetStatus: Partial<Record<WikiTarget['status'], string>> = {
+  missing: '原件缺失', trashed: '已移入回收站', purged: '回收站原件已清理',
+};
+
 function TargetLabel({ entry }: { entry: WikiTarget }) {
-  const type = [kinds[entry.kind], entry.projectTopic, entry.status === 'missing' ? '原件缺失' : ''].filter(Boolean).join(' · ');
+  const type = [kinds[entry.kind], entry.projectTopic, targetStatus[entry.status]].filter(Boolean).join(' · ');
   return <><strong>{entry.name}</strong><small>{type}</small><small>{entry.path}</small></>;
 }
 
@@ -78,11 +83,13 @@ export function useWikiCompletion(draft: WikiDraft | undefined, apply: (entry: W
 
 export function WikiDestination({ target, onClose }: { target: string; onClose: () => void }) {
   const navigate = useNavigate();
+  const [params] = useSearchParams();
   const resolution = useRead<WikiResolution>('/files/wiki/resolve?' + new URLSearchParams({ target }));
   const id = resolution.value?.state === 'resolved' ? resolution.value.choices[0]?.id : undefined;
+  const destination = id ? libraryFileUrl(params, { file: id }) : undefined;
   useEffect(() => {
-    if (id) navigate('/library?' + new URLSearchParams({ file: id }), { replace: true });
-  }, [id, navigate]);
+    if (destination) navigate(destination, { replace: true });
+  }, [destination, navigate]);
 
   return <article className="panel library-preview">
     <div className="drawer-head"><h2>双链目标</h2>
@@ -90,7 +97,7 @@ export function WikiDestination({ target, onClose }: { target: string; onClose: 
     {resolution.value?.state === 'ambiguous' ? <>
       <p className="file-status">有多个文件匹配「{target}」。请选择要打开的文件。</p>
       <div className="wiki-options">{resolution.value.choices.map(entry => <Link key={entry.id}
-        to={'/library?' + new URLSearchParams({ file: entry.id })} replace>
+        to={libraryFileUrl(params, { file: entry.id })} replace>
         <TargetLabel entry={entry} />
       </Link>)}</div>
     </> : resolution.value?.state === 'missing' ? <Empty title="找不到链接目标">
@@ -100,13 +107,14 @@ export function WikiDestination({ target, onClose }: { target: string; onClose: 
 }
 
 export function WikiBacklinks({ file }: { file: string }) {
+  const [params] = useSearchParams();
   const [open, setOpen] = useState(false);
   const incoming = useRead<WikiBacklink[]>(open ? '/files/' + encodeURIComponent(file) + '/backlinks' : null);
   return <details className="wiki-backlinks" onToggle={event => setOpen(event.currentTarget.open)}>
     <summary>反向链接</summary>
     {open && (incoming.value ? incoming.value.length ? <ul>
       {incoming.value.map(entry => <li key={entry.id + '/' + entry.at}>
-        <Link to={'/library?' + new URLSearchParams({ file: entry.id, at: String(entry.at), revision: entry.revision })}>
+        <Link to={libraryFileUrl(params, { file: entry.id, at: String(entry.at), revision: entry.revision })}>
           {entry.name} · {entry.label}
         </Link>
         <p>{entry.snippet}</p>

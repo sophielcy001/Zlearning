@@ -1,4 +1,4 @@
-import { Archive, Gauge, HardDrive, Plug } from 'lucide-react';
+import { Archive, BookOpen, Bot, Gauge, HardDrive, Layers3, Plug } from 'lucide-react';
 import { Link, NavLink } from 'react-router-dom';
 import { api, dateLabel, timeLabel, type DemoState } from './api';
 import { DailyBudgetPanel } from './daily-budget';
@@ -7,7 +7,10 @@ import { BackupSettings } from './backup-settings';
 import { ModelSettings } from './model-settings';
 import { ModelUsageLedger } from './model-usage';
 import { ReminderPreferences } from './reminders';
-import { ErrorNote, useAction } from './shared';
+import { CapabilityCatalog } from './skill-library';
+import { ProfessionalAgents } from './professional-agents';
+import { LocalMemory } from './local-memory';
+import { ErrorNote, useAction, useRead } from './shared';
 
 function SystemSettings({ state, onChange, libraryPath }: { state: DemoState; onChange: () => void; libraryPath?: string }) {
   const action = useAction();
@@ -38,21 +41,30 @@ function SystemSettings({ state, onChange, libraryPath }: { state: DemoState; on
 export function Management({ state, onChange, libraryPath, area = 'system' }: {
   state?: DemoState;
   onChange: () => void;
-  area?: 'system' | 'models' | 'backups' | 'budget';
+  area?: 'system' | 'models' | 'backups' | 'budget' | 'skills' | 'agents' | 'memory';
   libraryPath?: string;
 }) {
+  const memory = useRead<{ waiting: number }>('/memories/summary');
+  const waiting = memory.value?.waiting ?? 0;
   return <section className="page management-page">
     <div className="page-head"><h1>管理中心</h1></div>
     <div className="management-layout">
       <nav className="panel management-nav" aria-label="管理中心分类">
         <NavLink to="/settings/models"><Plug size={18} aria-hidden="true" />API与模型</NavLink>
         <NavLink to="/settings/budget"><Gauge size={18} aria-hidden="true" />额度恢复</NavLink>
+        <NavLink to="/settings/agents"><Bot size={18} aria-hidden="true" />专业 Agent</NavLink>
+        <NavLink to={waiting ? '/settings/memory?view=pending' : '/settings/memory'}><BookOpen size={18} aria-hidden="true" />
+          {waiting ? '记忆待确认（' + waiting + '）' : '记忆'}</NavLink>
+        <NavLink to="/settings/skills"><Layers3 size={18} aria-hidden="true" />能力库</NavLink>
         <NavLink to="/settings/backups"><Archive size={18} aria-hidden="true" />备份与恢复</NavLink>
         <NavLink to="/settings" end><HardDrive size={18} aria-hidden="true" />系统设置</NavLink>
       </nav>
       <div className="management-content">
         {area === 'models' && <ModelSettings />}
         {area === 'backups' && <BackupSettings onChange={onChange} />}
+        {area === 'skills' && <CapabilityCatalog />}
+        {area === 'agents' && <ProfessionalAgents />}
+        {area === 'memory' && <LocalMemory onChange={memory.refresh} />}
         {area === 'budget' && <><DailyBudgetPanel onChange={onChange} /><ModelUsageLedger /></>}
         {area === 'system' && state && <SystemSettings state={state} onChange={onChange} libraryPath={libraryPath} />}
       </div>

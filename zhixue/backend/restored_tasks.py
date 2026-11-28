@@ -3,8 +3,8 @@ from datetime import UTC, datetime
 from sqlalchemy import case, delete, or_, select, update
 
 from .db import (
-    AssessmentJob, ChatModelCall, ChatReply, GenerationStep, GoalAuthoringJob, GraphRecommendation, LessonConsolidation, LessonQuestion, ModelStudy, ModelUse, NoteCheckBatch, NoteCheckPlan,
-    LibraryClassification, LibraryClassificationCandidate, NoteSuggestion, PrerequisiteCall,
+    AgentAuthoringJob, AssessmentJob, ChatModelCall, ChatReply, GenerationStep, GoalAuthoringJob, GraphRecommendation, LessonConsolidation, LessonQuestion, MemoryInferenceJob, ModelStudy, ModelUse, NoteCheckBatch, NoteCheckPlan,
+    LibraryClassification, LibraryClassificationCandidate, NoteSuggestion, PrerequisiteCall, ProfessionalAgent,
     PrerequisiteTask, RecognitionGrant, RemediationCard, StageReview, StageReviewCall, Task, Timer, transaction,
 )
 from .project_activity import study_moment
@@ -46,6 +46,12 @@ def hold_restored_tasks(engine, at: datetime) -> tuple[int, int]:
     with transaction(engine) as db:
         settle_open_charges(db, clock)
         db.execute(delete(RecognitionGrant))
+        for agent in db.scalars(select(ProfessionalAgent)):
+            permissions = {"autoMemory", "autoMemoryRecipient", "mcpRepositories"}
+            if permissions.intersection(agent.definition):
+                agent.definition = {key: value for key, value in agent.definition.items() if key not in permissions}
+                agent.revision += 1
+                agent.confirmation = ""
         count = hold_generation(db)
         jobs = (
             (AssessmentJob, "error", "blocked"), (LessonQuestion, "error", "blocked"), (ChatReply, "error", "blocked"),
@@ -74,7 +80,7 @@ def hold_restored_tasks(engine, at: datetime) -> tuple[int, int]:
         db.execute(update(NoteCheckBatch).where(NoteCheckBatch.state == "running").values(
             state="failed", error="restored",
         ))
-        for model in (GraphRecommendation, LibraryClassification, GoalAuthoringJob):
+        for model in (GraphRecommendation, LibraryClassification, GoalAuthoringJob, AgentAuthoringJob, MemoryInferenceJob):
             count += db.execute(update(model).where(model.state.in_(("queued", "running", "blocked"))).values(
                 state="failed", error="restored", scope=None, daily_blocked_on=None,
             )).rowcount
@@ -82,7 +88,7 @@ def hold_restored_tasks(engine, at: datetime) -> tuple[int, int]:
             LibraryClassificationCandidate.state == "approved",
         ).values(state="pending", approved=None, decided_at=None)).rowcount
         for model in (ModelUse, ChatModelCall, PrerequisiteCall, StageReviewCall, NoteSuggestion, NoteCheckBatch,
-                      GraphRecommendation, LibraryClassification, GoalAuthoringJob):
+                      GraphRecommendation, LibraryClassification, GoalAuthoringJob, AgentAuthoringJob, MemoryInferenceJob):
             db.execute(update(model).where(model.started_at.is_not(None), model.finished_at.is_(None)).values(
                 finished_at=case((model.started_at > clock, model.started_at), else_=clock),
                 status=case((model.status == "reserved", "not_sent"), else_="uncertain"),

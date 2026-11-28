@@ -110,11 +110,20 @@ def test_verified_model_lesson_schedules_and_grades_only_the_core_ability(tmp_pa
         plan = ok(http.get("/api/study-plan"))
         assert plan["days"][0]["estimatedCompletedMinutes"] == 5 and not plan["pendingLocks"]
         report_path = f"/api/study-report?period=day&on={item['dueOn']}"
-        assert ok(http.get(report_path))["totals"]["review"] == {"passed": 0, "hinted": 0, "failed": 0, "ungraded": 1}
+        ungraded = ok(http.get(report_path))
+        assert ungraded["totals"]["review"] == {"passed": 0, "hinted": 0, "failed": 0, "ungraded": 1}
+        record, = ungraded["reviewRecords"]
+        assert (record["lessonId"], record["key"], record["round"], record["on"], record["outcome"], record["groupId"]) == (
+            lesson, item["key"], 1, item["dueOn"], "ungraded", group["id"],
+        )
+        assert record["title"] == item["title"]
         assert assess_one(tmp_path, GRADE, prompts, on_request=lambda: [ok(http.post("/api/demo/next-day")) for _ in range(3)])
         saved = ok(http.get(target))
         assert saved["result"]["outcome"] == "passed" and saved["result"]["gradingDelayed"]
-        assert ok(http.get(report_path))["totals"]["review"] == {"passed": 1, "hinted": 0, "failed": 0, "ungraded": 0}
+        graded = ok(http.get(report_path))
+        assert graded["totals"]["review"] == {"passed": 1, "hinted": 0, "failed": 0, "ungraded": 0}
+        assert graded["reviewRecords"] == [{**record, "outcome": "passed"}]
+        assert ok(http.get("/api/study-report?period=day"))["reviewRecords"] == []
         assert saved["result"]["dueOn"] == (today + timedelta(days=3)).isoformat()
         current, = [entry for entry in ok(http.get("/api/reviews"))["reviews"] if entry["lessonId"] == lesson]
         assert current["stage"] == 1 and current["status"] == "due"
@@ -183,9 +192,9 @@ def test_early_practice_and_assisted_answers_leave_the_stage_unchanged(tmp_path)
         assert assess_one(tmp_path, {**GRADE, "items": GRADE["items"][:1]}, prompts)
         assert ok(http.get(target))["result"]["outcome"] == "passed"
         assert review(http, lesson)["dueOn"] == item["dueOn"] and review(http, lesson)["stage"] == 0
-        assert ok(http.get("/api/study-report?period=day"))["totals"]["review"] == {
-            "passed": 0, "hinted": 0, "failed": 0, "ungraded": 0,
-        }
+        data = ok(http.get("/api/study-report?period=day"))
+        assert data["totals"]["review"] == {"passed": 0, "hinted": 0, "failed": 0, "ungraded": 0}
+        assert data["reviewRecords"] == []
 
         ok(http.post("/api/demo/next-day"))
         official = ok(http.get(endpoint))["group"]

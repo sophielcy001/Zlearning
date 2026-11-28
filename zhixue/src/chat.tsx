@@ -4,6 +4,8 @@ import { Link, NavLink, useNavigate, useParams } from 'react-router-dom';
 import { api, courseUrl, projectUrl } from './api';
 import { AssistantScope, type AssistantSettings } from './assistant-scope';
 import { ModelChatDialog, useChatModel, type ModelChatDraft } from './chat-model';
+import { ChatMemoryAction } from './local-memory';
+import type { AgentConfig } from './professional-agents';
 import { AuthorizationDialog, type Consent } from './generation';
 import { GoalAuthoring, useGoalAuthoring, type GoalChanges } from './goal-authoring';
 import { FailoverRecord } from './model-backup';
@@ -16,6 +18,7 @@ import { CourseActionDialog } from './route-versions';
 import { BackedStatus, Empty, ErrorNote, FileUpload, Markdown, useAction, useRead } from './shared';
 import { TeachingStyleSelect } from './teaching-style';
 import { citationUrl } from './verification';
+import { McpSourceLink } from './repository-mcp';
 import { VoiceInput } from './voice-input';
 
 const LEGACY_KEY = 'zhixue-demo-conversation';
@@ -80,6 +83,7 @@ function messageDraft(key: string | undefined) {
   try { return localStorage.getItem(key) ?? ''; } catch { return ''; }
 }
 
+const AUTO_SKILL = ':auto';
 const COURSE_ACTION_PHRASES = new Set([
   '这节我已经会了', '这节我会了', '把这个知识点提前', '把这节提前', '修改我的学习目标', '修改学习目标',
 ]);
@@ -93,6 +97,10 @@ function MessageComposer({ send, pending, locked = false, draftKey, intent = '',
   const [input, setInput] = useState(() => messageDraft(draftKey));
   const attempt = useRef<{ key: string; id: string; conversationId?: string } | null>(null);
   const available = useChatModel(Boolean(model));
+  const agents = useRead<{ items: AgentConfig[] }>(model ? '/agents' : null);
+  const [agentId, setAgentId] = useState('');
+  const [skill, setSkill] = useState(AUTO_SKILL);
+  const agent = agents.value?.items.find(item => item.id === agentId);
   const [modelDraft, setModelDraft] = useState<ModelChatDraft>();
   const checking = Boolean(model && !available.value && !available.error);
   const courseAction = allowCourseActions && COURSE_ACTION_PHRASES.has(input.replace(/\s+/gu, '')
@@ -110,11 +118,19 @@ function MessageComposer({ send, pending, locked = false, draftKey, intent = '',
     event.preventDefault();
     const text = input.trim();
     if (!text || pending || inputLocked || checking) return;
-    const key = JSON.stringify([text, intent]);
+    const key = JSON.stringify([text, intent, agent?.id, skill]);
     if (attempt.current?.key !== key) attempt.current = { key, id: crypto.randomUUID() };
-    if (model && available.value?.available) {
+    if (model && (agent || available.value?.available)) {
       attempt.current.conversationId ??= model.conversationId ?? crypto.randomUUID();
-      setModelDraft({ conversationId: attempt.current.conversationId, id: attempt.current.id, text });
+      setModelDraft({
+        conversationId: attempt.current.conversationId, id: attempt.current.id, text,
+        agentId: agent?.id,
+        skill: agent && skill !== AUTO_SKILL && skill ? skill : undefined,
+        autoSkill: Boolean(agent?.skills.length && skill === AUTO_SKILL),
+        knowledgeEnabled: Boolean(agent?.knowledgeFolders?.length),
+        memoryAgentId: agent?.memoryScopes?.length ? agent.id : undefined,
+        mcpEnabled: Boolean(agent?.mcpRepositories?.length),
+      });
       return;
     }
     if (await send(text, attempt.current.id)) {
@@ -124,6 +140,20 @@ function MessageComposer({ send, pending, locked = false, draftKey, intent = '',
   }
   return <>
     <form className="chat-composer panel" onSubmit={submit}>
+      {model && !!agents.value?.items.length && <div className="agent-chat-options">
+        <label className="project-field">聊天 Agent<select value={agentId} disabled={pending}
+          onChange={event => { setAgentId(event.target.value); setSkill(AUTO_SKILL); }}>
+          <option value="">智学助手</option>
+          {agents.value.items.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
+        </select></label>
+        {!!agent?.skills.length && <label className="project-field">本次使用的 Skill<select value={skill} disabled={pending}
+          onChange={event => setSkill(event.target.value)}>
+          <option value={AUTO_SKILL}>自动匹配</option>
+          <option value="">不附带 Skill</option>
+          {agent.skills.map(name => <option key={name} value={name}>{name}</option>)}
+        </select></label>}
+      </div>}
+
       <textarea aria-label="对话消息" placeholder="输入你的问题" value={input} maxLength={2000} disabled={pending}
         onChange={event => storeInput(event.target.value)} />
       <div className="chat-composer-actions">
@@ -132,7 +162,7 @@ function MessageComposer({ send, pending, locked = false, draftKey, intent = '',
         <button className="button primary" aria-label="发送消息" disabled={!input.trim() || pending || inputLocked || checking}><Send size={17} /></button>
       </div>
     </form>
-    {model && available.value?.available === false && <Link className="text-action" to="/settings/models">配置主模型以使用模型聊天</Link>}
+    {model && !agent?.connectionId && available.value?.available === false && <Link className="text-action" to="/settings/models">配置主模型以使用模型聊天</Link>}
     {modelDraft && model && <ModelChatDialog draft={modelDraft} withHistory={Boolean(model.conversationId)}
       close={() => setModelDraft(undefined)} saved={thread => {
         setModelDraft(undefined);
@@ -360,10 +390,25 @@ function ChatMessage({ message, pending, onFavorite, onRetry, onModelRetry }: {
     {message.role === 'demo' && <span className="message-label"><Sparkles size={15} />智学 · 本地演示</span>}
     {answer && <span className="message-label"><Sparkles size={15} />课内助手{answer.recipient && ` · ${answer.recipient.name}`}</span>}
     {question?.selection && <blockquote className="question-excerpt">{question.selection.text}</blockquote>}
-    {modelReply && <span className="message-label"><Sparkles size={15} />智学 · {modelReply.recipient.name}</span>}
+    {modelReply && <span className="message-label"><Sparkles size={15} />{modelReply.agent?.name ?? '智学'} · {modelReply.recipient.name}</span>}
+    {modelReply?.agent?.skill && <p className="model-help">Skill {modelReply.agent.skill.name} · 第 {modelReply.agent.skill.position} 版
+      {modelReply.agent.skillMode === 'automatic' && ' · 自动选用'}</p>}
+    {!!modelReply?.agent?.knowledge?.excerpts.length && <details className="model-help">
+      <summary>资料片段 · {modelReply.agent.knowledge.excerpts.length} 条</summary>
+      <ul>{modelReply.agent.knowledge.excerpts.map(item => <li key={item.id + ':' + item.number}>
+        <strong>{item.name} · {item.label}</strong><p>{item.excerpt}</p>
+      </li>)}</ul>
+    </details>}
+    {!!modelReply?.agent?.memories?.length && <p className="model-help">已确认记忆 · {modelReply.agent.memories.length} 条</p>}
+    {modelReply?.agent?.mcp && <details className="model-help">
+      <summary>仓库资料 · {modelReply.agent.mcp.repository}</summary>
+      <McpSourceLink source={modelReply.agent.mcp.source} label="查看原条目" />
+      <pre className="skill-source">{modelReply.agent.mcp.excerpt}</pre>
+    </details>}
     {message.text && (modelReply ? <Markdown>{message.text}</Markdown> : <p className={answer ? 'evidence-text' : undefined}>{message.text}</p>)}
-    {modelReply?.state === 'queued' && <p className="model-help" role="status">问题已保存，等待主模型。</p>}
-    {modelReply?.state === 'running' && <p className="model-help" role="status">主模型正在回复。</p>}
+    {message.role === 'user' && message.text.trim() && <ChatMemoryAction original={message} />}
+    {modelReply?.state === 'queued' && <p className="model-help" role="status">{modelReply.agent ? '问题已保存，等待所选模型。' : '问题已保存，等待主模型。'}</p>}
+    {modelReply?.state === 'running' && <p className="model-help" role="status">{modelReply.agent ? '所选模型正在回复。' : '主模型正在回复。'}</p>}
     {modelReply?.state === 'blocked' && <ErrorNote message={modelReply.error ?? '暂时无法完成模型回复。'}
       retry={() => onModelRetry(modelReply)} />}
     {(modelReply?.errorCode === 'daily_budget' || isMoneyHold(modelReply?.errorCode)) &&
@@ -512,7 +557,9 @@ function ThreadPane({ id, refreshed, projectCreated, assistant = false, selectio
       pending={action.pending} send={send} /> : <MessageComposer pending={action.pending} send={send}
         model={thread.lessonId ? undefined : { conversationId: id, saved: retainTranscript }}
         draftKey={thread.lessonId ? undefined : 'zhixue-chat-draft:' + id} />}
-    {retryReply && <ModelChatDialog draft={{ conversationId: id, id: retryReply.questionId, text: retryReply.questionText, retry: true }}
+    {retryReply && <ModelChatDialog draft={{
+      conversationId: id, id: retryReply.questionId, text: retryReply.questionText, retry: true, memoryAgentId: retryReply.agent?.id,
+    }}
       withHistory={retryReply.hasHistory} close={() => setRetryReply(undefined)}
       saved={next => { setRetryReply(undefined); retainTranscript(next); }} />}
     {canMarkLearned && <button type="button" className="text-action assistant-history-link learned-reminder" onClick={showLearnedControl}>

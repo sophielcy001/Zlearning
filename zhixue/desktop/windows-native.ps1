@@ -1,6 +1,6 @@
 param(
   [Parameter(Mandatory = $true)]
-  [ValidateSet('machine', 'snapshot', 'visible', 'close', 'minimize', 'quit', 'dialog')]
+  [ValidateSet('machine', 'snapshot', 'visible', 'foreground', 'close', 'minimize', 'quit', 'dialog')]
   [string]$Mode,
   [int]$RootId,
   [string]$WindowTitle,
@@ -151,7 +151,7 @@ public static class EvaluationWindow {
 }
 '@
 
-if ($Mode -in @('visible', 'close', 'minimize', 'quit')) {
+if ($Mode -in @('visible', 'foreground', 'close', 'minimize', 'quit')) {
   if ([string]::IsNullOrWhiteSpace($WindowTitle)) { throw 'The learning window title is required.' }
   $learningWindow = [EvaluationWindow]::FindVisibleWindow($RootId, $WindowTitle)
 }
@@ -222,6 +222,11 @@ function Send-WindowKey([string]$Key, [IntPtr]$Window, [IntPtr]$Button = [IntPtr
     throw 'The test window did not acquire keyboard focus. No key was sent.'
   }
   throw 'The expected default button did not acquire keyboard focus. No key was sent.'
+}
+
+if ($Mode -eq 'foreground') {
+  Write-Result @{ owned = $learningWindow -ne [IntPtr]::Zero -and (Test-WindowForeground $learningWindow) }
+  return
 }
 
 if ($Mode -eq 'quit') {

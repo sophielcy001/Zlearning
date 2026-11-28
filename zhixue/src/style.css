@@ -591,6 +591,16 @@ progress::-webkit-progress-value { background: var(--indigo); border-radius: 9px
 .library-file small { color: var(--muted); }
 .library-file small, .hit-excerpt { overflow-wrap: anywhere; }
 .hit-excerpt { margin: 2px 0; line-height: 1.5; }
+.library-semantic-excerpt { margin: 0 6px 8px 32px; font-size: .84rem; }
+.library-semantic-excerpt summary { color: var(--indigo-ink); }
+.library-semantic-excerpt p {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border-left: 2px solid var(--line);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
 .library-list .search { margin-bottom: 8px; }
 .library-preview { padding: 18px; }
 .library-preview .drawer-head { align-items: start; gap: 6px; }
@@ -608,6 +618,11 @@ progress::-webkit-progress-value { background: var(--indigo); border-radius: 9px
 .trash-move-plan { display: grid; gap: 6px; max-height: min(390px, 50dvh); overflow: auto; overflow-wrap: anywhere; }
 .trash-move-plan > div { padding: 7px 9px; border-bottom: 1px solid var(--line); }
 .trash-move-plan .file-path { margin: 3px 0; }
+.trash-wiki-impact { margin-top: 6px; color: var(--indigo-ink); }
+.trash-wiki-impact summary { cursor: pointer; }
+.trash-wiki-impact ul { list-style: none; margin: 5px 0; padding: 0 0 0 14px; }
+.trash-wiki-impact li + li { margin-top: 5px; }
+.trash-wiki-impact .file-path { display: block; }
 .file-preview-actions, .file-pagination { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .file-preview-actions { margin-bottom: 12px; }
 .web-import-form, .web-duplicate { display: grid; gap: 10px; }
@@ -1014,6 +1029,14 @@ progress::-webkit-progress-value { background: var(--indigo); border-radius: 9px
 .report-list li > span { font-size: .89rem; color: var(--muted); }
 .report-correction-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; min-width: 0; }
 .report-correction-fields label { display: grid; gap: 4px; min-width: 0; color: var(--muted); font-size: .87rem; }
+.report-timer-filters { max-width: 40rem; margin-block: 8px 14px; }
+.report-timer-filters .text-action { justify-self: start; }
+.report-timer-records details { border-top: 1px solid var(--line); padding-top: 10px; }
+.report-timer-records details + details { margin-top: 12px; }
+.report-formal-records { margin-bottom: 12px; }
+.report-review-filter { grid-template-columns: minmax(0, 1fr); max-width: 19rem; margin-block: 9px 6px; }
+:is(.report-timer-records, .report-formal-records) .report-list li > div { min-width: 0; overflow-wrap: anywhere; }
+.report-record-more { margin-top: 8px; }
 
 @media (max-width: 900px) {
   .report-columns { grid-template-columns: minmax(0, 1fr); }
@@ -1115,3 +1138,20 @@ progress::-webkit-progress-value { background: var(--indigo); border-radius: 9px
 .library-view-switch { display: flex; gap: 4px; padding: 3px; width: fit-content; margin-bottom: 12px; background: #edf0f8; border: 1px solid var(--line); border-radius: 10px; }
 .library-view-switch a { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); border-radius: 7px; font-size: .86rem; padding: 6px 10px; }
 .library-view-switch a:hover, .library-view-switch a[aria-current='page'] { color: var(--indigo-ink); background: var(--panel); }
+
+.skill-library-heading { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; justify-content: space-between; margin: 14px 0; }
+.skill-list { list-style: none; margin: 0; padding: 0; }
+.skill-list li { display: flex; gap: 14px; align-items: center; justify-content: space-between; padding: 12px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+.skill-list li p { margin: 4px 0 0; }
+.skill-list li button { flex: none; }
+.skill-fields { margin: 0; }
+.skill-fields div { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 10px; padding: 6px 0; }
+.skill-fields dd, .skill-source { overflow-wrap: anywhere; }
+.skill-source { margin: 8px 0 0; padding: 12px; max-height: 320px; overflow: auto; white-space: pre-wrap; background: #fafbff; border: 1px solid var(--line); border-radius: 9px; }
+.skill-compare { table-layout: fixed; width: 100%; }
+.skill-compare :is(th, td) { overflow-wrap: anywhere; }
+.agent-fields { min-width: 0; display: grid; gap: 10px; border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; }
+.agent-fields legend { font-weight: 650; }
+.agent-fields textarea { min-height: 64px; resize: vertical; }
+.agent-chat-options { display: flex; flex-wrap: wrap; gap: 10px; }
+.agent-chat-options .project-field { min-width: 130px; }

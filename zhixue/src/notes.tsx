@@ -53,7 +53,7 @@ function conflictId(error: unknown) {
   return undefined;
 }
 
-function NoteDiff({ lines }: { lines: string[] }) {
+export function NoteDiff({ lines }: { lines: string[] }) {
   return <div className="note-difference">
     <strong>版本差异</strong>
     {lines.length ? <pre aria-label="版本差异">{lines.map((line, index) =>

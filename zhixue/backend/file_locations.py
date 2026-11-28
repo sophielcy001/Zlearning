@@ -1,9 +1,11 @@
 from collections import defaultdict
+import ctypes
 from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
 from stat import S_ISREG
+from struct import unpack_from
 import sys
 
 from sqlalchemy import select, text
@@ -50,6 +52,45 @@ def checked_path(folder: Path, relative: str) -> Path:
     return path
 
 
+def _load_linux_statx():
+    if sys.platform != "linux":
+        return None
+    try:
+        statx = ctypes.CDLL(None).statx
+    except (AttributeError, OSError):
+        return None
+    statx.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint, ctypes.c_void_p)
+    statx.restype = ctypes.c_int
+    return statx
+
+
+_linux_statx = _load_linux_statx()
+_STATX_INO = 0x0100
+_STATX_BTIME = 0x0800
+_AT_FDCWD = -100
+_AT_SYMLINK_NOFOLLOW = 0x0100
+
+
+def _linux_birth_time(path: Path, stat: os.stat_result) -> int | None:
+    if _linux_statx is None:
+        return None
+    # Linux's fixed statx ABI has a 256-byte buffer with native-endian fields.
+    result = ctypes.create_string_buffer(256)
+    wanted = _STATX_INO | _STATX_BTIME
+    if _linux_statx(_AT_FDCWD, os.fsencode(path), _AT_SYMLINK_NOFOLLOW, wanted, result):
+        return None
+    mask, = unpack_from("=I", result)
+    if mask & wanted != wanted:
+        return None
+    inode, = unpack_from("=Q", result, 32)
+    major, minor = unpack_from("=II", result, 136)
+    # A pathname may have been replaced between the two metadata lookups.
+    if inode != stat.st_ino or (major, minor) != (os.major(stat.st_dev), os.minor(stat.st_dev)):
+        return None
+    seconds, nanos = unpack_from("=qI", result, 80)
+    return seconds * 1_000_000_000 + nanos
+
+
 def identity_of(path: Path) -> FileIdentity | None:
     try:
         stat = path.stat(follow_symlinks=False)
@@ -60,6 +101,8 @@ def identity_of(path: Path) -> FileIdentity | None:
     birth = getattr(stat, "st_birthtime_ns", None)
     if birth is None and (seconds := getattr(stat, "st_birthtime", None)) is not None:
         birth = int(seconds * 1_000_000_000)
+    if birth is None:
+        birth = _linux_birth_time(path, stat)
     if birth is None and sys.platform == "win32" and sys.version_info < (3, 12):
         # Windows Python 3.11 reports creation time as st_ctime_ns.
         birth = stat.st_ctime_ns or None
@@ -218,6 +261,8 @@ class LocationTracker:
         ):
             if row.birth_time is None and current.birth is not None:
                 row.birth_time = current.birth
+            if row.missing:
+                row.missing = False
             return FileLocation(path, "ready")
 
         candidates = self.matches(row, default.suffix.lower(), exclude=path)
@@ -247,9 +292,9 @@ class LocationTracker:
             if path == exclude or path.suffix.lower() != suffix:
                 continue
             stat = entries[path]
-            if row.birth_time is not None and stat.birth is not None:
-                credible = row.birth_time == stat.birth
-            else:
+            credible = row.birth_time is not None and row.birth_time == stat.birth
+            if not credible and (sys.platform == "win32" or row.birth_time is None or stat.birth is None):
+                # Windows can carry a prior occupant's creation time over to the renamed file.
                 credible = row.revision is not None and known_body(path) == row.revision
             if credible:
                 matches.append((path, stat))

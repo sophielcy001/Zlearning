@@ -69,11 +69,12 @@ class MobilePush:
                 "pairing": target.pairing,
             }, ttl)
             # A provider can take delivery even when its response did not reach this process.
-            delivered = result in ("accepted", "uncertain")
-            settle_push(self.engine, notice, delivered=delivered)
+            with self.pairing.hold_push_target(target) as target_is_current:
+                delivered = target_is_current and result in ("accepted", "uncertain")
+                settle_push(self.engine, notice, delivered=delivered)
             if result == "expired":
                 self.pairing.expire_push(target)
-            return POLL_SECONDS if delivered else RETRY_SECONDS
+            return POLL_SECONDS if delivered or not target_is_current else RETRY_SECONDS
         finally:
             if runtime is not None:
                 runtime.leave()

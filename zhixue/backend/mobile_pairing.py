@@ -1,5 +1,6 @@
 """Desktop endpoint for pairing and encrypted mobile operations."""
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from hashlib import sha256
 from hmac import compare_digest
@@ -280,6 +281,12 @@ class DesktopPairing:
         contact = link.relay if link.relay.startswith("https://") else None
         pairing = sha256(link.room.encode("ascii")).hexdigest()
         return PushTarget(receiver, push.private, subscription, pairing, contact)
+
+    @contextmanager
+    def hold_push_target(self, target: PushTarget) -> Iterator[bool]:
+        """Keep the subscription stable while its delivery receipt is recorded."""
+        with self.lock:
+            yield self.push_target() == target
 
     def expire_push(self, target: PushTarget) -> None:
         with self.lock:

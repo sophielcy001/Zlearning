@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from .content import lesson_course
 from .course_disputes import pending_disputes_count
 from .daily_budget import recoverable
-from .daily_plan import Slot, clock, fits, load_availability, minute
+from .daily_plan import Slot, appointment_subject, clock, fits, load_availability, minute
 from .daily_plan_api import ClockText
 from .db import Lesson, Project, ReminderPushClaim, ReminderReceipt, ReminderSettings, StudyPlanLock, transaction
 from .mobile_api import mobile_review_ready, workspace_id
@@ -25,6 +25,7 @@ from .review_queue import review_queue
 
 
 DAILY = "daily"
+DISPUTES = "course-disputes"
 BUDGET = "daily-budget"
 Version = Annotated[int, Field(strict=True, ge=1)]
 ReminderAction = Literal["dismiss", "in_30_minutes", "tomorrow"]
@@ -55,6 +56,7 @@ class CheckInput(BaseModel):
 class ActionInput(BaseModel):
     action: ReminderAction
     version: Version
+    disputeReceipt: Shown | None = None
 
 
 class MobileSettingsScope(BaseModel):
@@ -137,7 +139,7 @@ def active_appointments(db: Session, today: date) -> list[CourseAppointment]:
         slot = Slot(row.day, row.start_minute, row.minutes)
         if row.day == today and not fits(slot, availability.windows(today)):
             continue
-        subject = f"lesson:{row.lesson_id}:{row.day.isoformat()}:{row.start_minute}"
+        subject = appointment_subject(row.lesson_id, slot)
         title = lesson_course(sample, position, outline).title
         appointments.append(CourseAppointment(subject, row.lesson_id, slot, title, topic))
     return appointments
@@ -177,11 +179,10 @@ def is_snoozed(receipt: ReminderReceipt | None) -> bool:
 def daily_details(db: Session, folder: Path, today: date, *, mobile: bool) -> dict | None:
     due = [(review, item) for _, _, review, item in review_queue(db, folder, today, through=today)
            if item["status"] == "due"]
-    disputes = pending_disputes_count(db, actionable_only=True)
-    if not due and not disputes:
+    if not due:
         return None
     reviews = sum(mobile_review_ready(db, review, item) for review, item in due) if mobile else len(due)
-    return {"kind": "daily", "reviews": reviews, "disputes": disputes}
+    return {"kind": "daily", "reviews": reviews, "disputes": 0}
 
 
 def check_reminders(db: Session, folder: Path, today: date, now: datetime, data: CheckInput, *, mobile=False) -> dict:
@@ -194,7 +195,7 @@ def check_reminders(db: Session, folder: Path, today: date, now: datetime, data:
     appointments = active_appointments(db, today)
     subjects = [DAILY, *(item.subject for item in appointments)]
     if not mobile:
-        subjects.append(BUDGET)
+        subjects.extend((DISPUTES, BUDGET))
     receipts = {row.subject: row for row in db.scalars(select(ReminderReceipt).where(ReminderReceipt.subject.in_(subjects)))}
     pending = {row.subject: row for row in db.scalars(select(ReminderPushClaim).where(
         ReminderPushClaim.subject.in_(subjects), ReminderPushClaim.expires_at > now,
@@ -235,7 +236,7 @@ def check_reminders(db: Session, folder: Path, today: date, now: datetime, data:
         available(retry)
         return True
 
-    def merge(subject: str, day: date, details: Callable[[], dict | None]) -> None:
+    def merge(subject: str, day: date, details: Callable[[], dict | None]) -> dict | None:
         if waiting_for_push(subject):
             return
         receipt = receipts.get(subject)
@@ -249,23 +250,33 @@ def check_reminders(db: Session, folder: Path, today: date, now: datetime, data:
             if mobile and subject == DAILY and not payload["reviews"]:
                 return
             if follow_up or fresh:
-                reminders.append(issue(db, receipt, subject, None, day, payload, delivery))
-            else:
-                reminders.append(card(receipt, payload))
-        elif follow_up and receipt is not None:
+                return issue(db, receipt, subject, None, day, payload, delivery)
+            return card(receipt, payload)
+        if follow_up and receipt is not None:
             receipt.snooze_on = receipt.snooze_at = None
             receipt.action = "dismiss"
+        return None
 
     def learning_items() -> dict | None:
         return daily_details(db, folder, today, mobile=mobile)
+
+    def dispute_items() -> dict | None:
+        count = pending_disputes_count(db, actionable_only=True)
+        return {"kind": "daily", "reviews": 0, "disputes": count} if count else None
 
     def budget_items() -> dict | None:
         count = sum(1 for _ in recoverable(db, folder, now, reminder=True))
         return {"kind": "budget", "count": count} if count else None
 
-    merge(DAILY, today, learning_items)
-    if not mobile:
-        merge(BUDGET, billing_day(now), budget_items)
+    daily = merge(DAILY, today, learning_items)
+    disputes = None if mobile else merge(DISPUTES, today, dispute_items)
+    if daily and disputes:
+        daily["disputes"] = disputes["disputes"]
+        daily["disputeReceipt"] = {"id": disputes["id"], "version": disputes["version"]}
+    if summary := daily or disputes:
+        reminders.append(summary)
+    if not mobile and (budget := merge(BUDGET, billing_day(now), budget_items)):
+        reminders.append(budget)
 
     for appointment in appointments:
         if waiting_for_push(appointment.subject):
@@ -345,18 +356,32 @@ def reminder_endpoints(engine: Engine, folder: Path, current_day: Callable[[Sess
         with transaction(engine) as db:
             same_workspace(db, workspace)
             receipt = db.get(ReminderReceipt, str(identity))
-            if receipt is None or workspace is not None and receipt.subject == BUDGET:
+            if receipt is None or workspace is not None and receipt.subject in (BUDGET, DISPUTES):
                 raise HTTPException(404, "找不到这条提醒。")
-            if receipt.version != data.version or receipt.action not in (None, data.action):
+            receipts = [(receipt, data.version)]
+            if related := data.disputeReceipt:
+                dispute = db.get(ReminderReceipt, str(related.id))
+                if (workspace is not None or receipt.subject != DAILY or dispute is None
+                        or dispute.subject != DISPUTES or dispute.sent_on != receipt.sent_on):
+                    raise HTTPException(409, "合并提醒已变化，请查看当前安排。")
+                receipts.append((dispute, related.version))
+            if any(row.version != version or row.action not in (None, data.action) for row, version in receipts):
                 raise HTTPException(409, "提醒已更新，请查看当前安排。")
-            if receipt.action is None:
-                receipt.action = data.action
-                receipt.delivery_key = None
+
+            snooze_at = now() + timedelta(minutes=30) if data.action == "in_30_minutes" else None
+            snooze_on = None
+            if data.action == "tomorrow":
+                day = billing_day(now()) if receipt.subject == BUDGET else current_day(db)
+                snooze_on = day + timedelta(days=1)
+            for row, _ in receipts:
+                if row.action is not None:
+                    continue
+                row.action = data.action
+                row.delivery_key = None
                 if data.action == "in_30_minutes":
-                    receipt.snooze_at = now() + timedelta(minutes=30)
+                    row.snooze_at = snooze_at
                 elif data.action == "tomorrow":
-                    day = billing_day(now()) if receipt.subject == BUDGET else current_day(db)
-                    receipt.snooze_on = day + timedelta(days=1)
+                    row.snooze_on = snooze_on
             return {"id": receipt.id, "version": receipt.version, "action": receipt.action,
                     "snoozeAt": receipt.snooze_at, "snoozeOn": receipt.snooze_on}
 

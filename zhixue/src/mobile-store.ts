@@ -24,6 +24,7 @@ const DEVICE = 'device';
 const PAIR_VERSION = 'pair-version';
 const downloadRemovalKey = (key: string) => 'download-removal:' + key;
 const pushRemovalKey = (room: string) => 'push-removal:' + room;
+const pushStateKey = (room: string) => 'push-state:' + room;
 export const MOBILE_TIMERS = 'timers';
 const pairChanges = typeof BroadcastChannel === 'undefined' ? undefined : new BroadcastChannel('zhixue-mobile-pairing');
 
@@ -119,7 +120,10 @@ export async function savePair(pair: MobilePair | undefined, expected?: string |
       if (roomChanged) {
         // Distinguish a device that returned to being unpaired from one that never changed.
         store.put(crypto.randomUUID(), PAIR_VERSION);
-        if (oldRoom) store.delete(pushRemovalKey(oldRoom));
+        if (oldRoom) {
+          store.delete(pushRemovalKey(oldRoom));
+          store.delete(pushStateKey(oldRoom));
+        }
       }
       if (pair) store.put(pair, 'pair');
       else store.delete('pair');
@@ -133,39 +137,71 @@ export async function savePair(pair: MobilePair | undefined, expected?: string |
   });
 }
 
-export async function pendingPushRemoval(room: string): Promise<string | undefined> {
+export type PhonePushState = { endpointId: string | null; pending: string[] };
+
+function readPhonePushState(store: IDBObjectStore, room: string, accept: (state: PhonePushState) => void) {
+  const current = store.get(pushStateKey(room));
+  const legacy = store.get(pushRemovalKey(room));
+  legacy.onsuccess = () => {
+    const state = current.result as PhonePushState | undefined;
+    const pending = state?.pending ?? [];
+    // Older clients saved one pending fingerprint as a string.
+    accept({ endpointId: state?.endpointId ?? null,
+      pending: typeof legacy.result === 'string' ? [...new Set([...pending, legacy.result])] : pending });
+  };
+}
+
+export async function phonePushState(room: string): Promise<PhonePushState> {
   const db = await localDatabase();
   return new Promise((resolve, reject) => {
-    const request = db.transaction(DEVICE).objectStore(DEVICE).get(pushRemovalKey(room));
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    const tx = db.transaction(DEVICE);
+    let state: PhonePushState;
+    readPhonePushState(tx.objectStore(DEVICE), room, value => { state = value; });
+    tx.oncomplete = () => resolve(state);
+    tx.onabort = () => reject(tx.error ?? new Error('手机推送状态读取未完成。'));
   });
 }
 
-export async function savePushRemoval(room: string, endpointId: string, acknowledged = false): Promise<boolean> {
+async function updatePhonePushState(room: string, update: (state: PhonePushState) => PhonePushState | undefined) {
   const db = await localDatabase();
-  return new Promise((resolve, reject) => {
+  return new Promise<boolean>((resolve, reject) => {
     const tx = db.transaction(DEVICE, 'readwrite', { durability: 'strict' });
     const store = tx.objectStore(DEVICE);
-    const key = pushRemovalKey(room);
     let changed = false;
     const pair = store.get('pair');
     pair.onsuccess = () => {
       if (pair.result?.room !== room || pair.result.invitation) return;
-      if (!acknowledged) {
-        store.put(endpointId, key);
+      readPhonePushState(store, room, previous => {
+        const state = update(previous);
+        if (!state) return;
+        const key = pushStateKey(room);
+        if (state.endpointId || state.pending.length) store.put(state, key);
+        else store.delete(key);
+        store.delete(pushRemovalKey(room));
         changed = true;
-      } else {
-        const pending = store.get(key);
-        pending.onsuccess = () => {
-          if (pending.result !== endpointId) return;
-          store.delete(key);
-          changed = true;
-        };
-      }
+      });
     };
     tx.oncomplete = () => resolve(changed);
-    tx.onabort = () => reject(tx.error ?? new Error('手机推送停用状态保存未完成。'));
+    tx.onabort = () => reject(tx.error ?? new Error('手机推送状态保存未完成。'));
+  });
+}
+
+export function rememberPushRegistration(room: string, endpointId: string | null) {
+  return updatePhonePushState(room, state => ({ ...state, endpointId }));
+}
+
+export function queuePushRemoval(room: string, localEndpointId: string | null) {
+  return updatePhonePushState(room, state => {
+    const pending = new Set(state.pending);
+    if (localEndpointId) pending.add(localEndpointId);
+    if (state.endpointId) pending.add(state.endpointId);
+    if (pending.size) return { ...state, pending: [...pending] };
+  });
+}
+
+export function acknowledgePushRemoval(room: string, removed: string, endpointId: string | null) {
+  return updatePhonePushState(room, state => {
+    if (state.pending.includes(removed)) return { endpointId, pending: state.pending.filter(id => id !== removed) };
   });
 }
 

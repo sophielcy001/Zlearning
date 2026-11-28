@@ -1,5 +1,6 @@
 """Verify a published deployment against this unpacked release."""
 import argparse
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import closing
 from hashlib import file_digest, sha256
 from http.client import HTTPException, HTTPSConnection
@@ -7,7 +8,10 @@ from ipaddress import ip_address
 import json
 from pathlib import Path
 import re
+from secrets import token_bytes, token_urlsafe
+import socket
 import ssl
+from time import monotonic, sleep
 from urllib.parse import urlsplit
 
 
@@ -50,69 +54,197 @@ def site_files(root):
     return files, sha256(manifest).hexdigest()
 
 
+def resolved_endpoints(origin, public):
+    parsed = urlsplit(origin)
+    try:
+        records = socket.getaddrinfo(parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM,
+                                     proto=socket.IPPROTO_TCP)
+    except OSError as error:
+        raise ValueError(f"{origin}: address resolution failed: {error}") from error
+    endpoints = {}
+    for family, _, protocol, _, target in records:
+        peer = ip_address(target[0])
+        require(not public or peer.is_global, f"{origin} resolved to a non-public address: {peer}")
+        endpoints[(family, target)] = (family, protocol, target)
+    require(endpoints, f"{origin} did not resolve to an HTTPS address")
+    return endpoints.values()
+
+
+class ResolvedHTTPSConnection(HTTPSConnection):
+    """Dial one address while retaining the origin's HTTP Host and TLS name."""
+
+    def __init__(self, origin, endpoint, context):
+        parsed = urlsplit(origin)
+        super().__init__(parsed.hostname, port=parsed.port, context=context, timeout=8)
+        self.endpoint = endpoint
+        self.tls_context = context
+
+    def connect(self):
+        family, protocol, target = self.endpoint
+        with socket.socket(family, socket.SOCK_STREAM, protocol) as raw:
+            raw.settimeout(self.timeout)
+            raw.connect(target)
+            require(ip_address(raw.getpeername()[0]) == ip_address(target[0]), "TCP peer differs from the verified address")
+            self.sock = self.tls_context.wrap_socket(raw, server_hostname=self.host)
+
+
 def verify_deployment(root, phone, relay, *, ca_file=None):
     phone, relay = https_origin(phone), https_origin(relay)
     require(urlsplit(phone).hostname != urlsplit(relay).hostname, "Phone and relay must use distinct hosts")
     files, manifest_digest = site_files(root.resolve())
+    endpoints = {origin: resolved_endpoints(origin, ca_file is None) for origin in (phone, relay)}
     context = ssl.create_default_context(cafile=str(ca_file) if ca_file else None)
-    peers = {}
+    peers = {origin: {} for origin in endpoints}
 
-    def fetch(origin, route, *, method="GET", headers=None, limit=4096):
-        address = urlsplit(origin)
+    def fetch(connection, origin, route, *, method="GET", headers=None, body=None, limit=4096):
         try:
-            with closing(HTTPSConnection(address.hostname, port=address.port, context=context, timeout=8)) as connection:
+            if connection.sock is None:
                 connection.connect()
-                socket = connection.sock
-                peer = ip_address(socket.getpeername()[0])
-                require(ca_file is not None or peer.is_global, f"{origin} connected to a non-public address: {peer}")
-                certificate = socket.getpeercert()
-                peers.setdefault(origin, {})[str(peer)] = {
-                    "tls": socket.version(), "certificateExpiry": certificate.get("notAfter"),
-                }
-                connection.request(method, route, headers={"Accept-Encoding": "identity", **(headers or {})})
-                with closing(connection.getresponse()) as response:
-                    body = response.read(limit + 1)
-                    require(len(body) <= limit, f"{origin}{route} response exceeds expected size")
-                    selected = {name: response.getheader(name, "") for name in (
-                        "Cache-Control", "Location", "Access-Control-Allow-Origin",
-                    )}
-                    return response.status, selected, body
+                channel = connection.sock
+                peer = str(ip_address(channel.getpeername()[0]))
+                peers[origin].setdefault(peer, {
+                    "tls": channel.version(), "certificateExpiry": channel.getpeercert().get("notAfter"),
+                })
+            connection.request(method, route, body=body, headers={"Accept-Encoding": "identity", **(headers or {})})
+            with closing(connection.getresponse()) as response:
+                body = response.read(limit + 1)
+                require(len(body) <= limit, f"{route} response exceeds expected size")
+                selected = {name: response.getheader(name, "") for name in (
+                    "Cache-Control", "Location", "Content-Type", "Access-Control-Allow-Origin",
+                    "Access-Control-Allow-Headers", "Access-Control-Allow-Methods",
+                )}
+                return response.status, selected, body
         except (OSError, HTTPException) as error:
-            raise ValueError(f"{origin}{route}: {error}") from error
+            raise ValueError(f"{route}: {error}") from error
 
     def cache(headers, expected, route):
         directives = {part.strip().lower() for part in headers["Cache-Control"].split(",")}
         require(set(expected).issubset(directives), f"{route} has unexpected Cache-Control: {headers['Cache-Control']}")
 
-    status, headers, _ = fetch(phone, "/")
-    require(status == 302 and headers["Location"] in ("/mobile/", phone + "/mobile/"), "Phone root did not redirect to /mobile/")
-    require(fetch(phone, "/healthz")[0] == 404, "Phone host must not serve the relay health route")
-    require(fetch(relay, "/mobile/")[0] == 404, "Relay host must not serve the phone entry")
-    for path, (expected, size) in sorted(files.items()):
-        route = "/mobile/" if path == "mobile/index.html" else "/" + path
-        status, headers, body = fetch(phone, route, limit=size)
-        require(status == 200 and sha256(body).hexdigest() == expected,
-                f"{route} does not match the release (HTTP {status})")
-        if path.startswith("assets/"):
-            cache(headers, ("public", "max-age=31536000", "immutable"), route)
-        elif path.startswith("mobile/"):
-            cache(headers, ("no-cache",), route)
+    def check_phone(connection):
+        status, headers, _ = fetch(connection, phone, "/")
+        require(status == 302 and headers["Location"] in ("/mobile/", phone + "/mobile/"),
+                "Phone root did not redirect to /mobile/")
+        require(fetch(connection, phone, "/healthz")[0] == 404, "Phone host must not serve the relay health route")
+        for path, (expected, size) in sorted(files.items()):
+            route = "/mobile/" if path == "mobile/index.html" else "/" + path
+            status, headers, body = fetch(connection, phone, route, limit=size)
+            require(status == 200 and sha256(body).hexdigest() == expected,
+                    f"{route} does not match the release (HTTP {status})")
+            if path.startswith("assets/"):
+                cache(headers, ("public", "max-age=31536000", "immutable"), route)
+            elif path.startswith("mobile/"):
+                cache(headers, ("no-cache",), route)
 
-    status, headers, body = fetch(relay, "/healthz", headers={"Origin": phone})
-    require(status == 200 and json.loads(body) == {"status": "ready"}, "Relay is not ready")
-    require(headers["Access-Control-Allow-Origin"] == phone, "Relay did not allow the phone origin")
-    cache(headers, ("no-store",), "Relay health")
-    status, headers, _ = fetch(relay, "/healthz", method="OPTIONS", headers={
-        "Origin": phone, "Access-Control-Request-Method": "GET",
-    })
-    require(status in (200, 204) and headers["Access-Control-Allow-Origin"] == phone, "Relay preflight rejected the phone origin")
-    status, headers, _ = fetch(relay, "/healthz", headers={"Origin": "https://unrelated-origin.invalid"})
-    require(status == 403 and not headers["Access-Control-Allow-Origin"], "Relay did not reject an unrelated origin")
-    cache(headers, ("no-store",), "Relay origin rejection")
+    def check_relay_round_trip(connection, room, allowed):
+        ticket, reply_token = token_urlsafe(32), token_urlsafe(32)
+        entry = f"/v1/{room}"
+        status, headers, _ = fetch(connection, relay, f"{entry}/exchange/{ticket}", method="OPTIONS", headers={
+            **allowed, "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "Content-Type",
+        })
+        methods = {part.strip() for part in headers["Access-Control-Allow-Methods"].split(",")}
+        allowed_headers = {part.strip().lower() for part in headers["Access-Control-Allow-Headers"].split(",")}
+        require(status in (200, 204) and headers["Access-Control-Allow-Origin"] == phone
+                and "POST" in methods and "content-type" in allowed_headers,
+                f"Relay exchange preflight did not allow the phone POST with Content-Type (HTTP {status})")
+
+        octets = {"Content-Type": "application/octet-stream"}
+        desktop = {"X-Reply-Token": reply_token}
+        request_packet, answer_packet = token_bytes(48), token_bytes(64)
+
+        def transfer(channel, route, expected_status, sent_headers, sent_body=None, expected_body=b""):
+            label = f"Relay {route}"
+            try:
+                status, headers, body = fetch(channel, relay, f"{entry}/{route}/{ticket}", method="POST",
+                                              headers=sent_headers, body=sent_body)
+            except ValueError as error:
+                raise ValueError(f"{label}: {error}") from error
+            require(status == expected_status, f"{label} returned HTTP {status}, expected {expected_status}")
+            cache(headers, ("no-store",), label)
+            require(body == expected_body, f"{label} returned a different payload")
+            if expected_body:
+                content_type = headers["Content-Type"].split(";", 1)[0].strip().lower()
+                require(content_type == octets["Content-Type"], f"{label} returned an unexpected Content-Type")
+            if "Origin" in sent_headers:
+                require(headers["Access-Control-Allow-Origin"] == phone,
+                        f"{label} did not allow the phone origin")
+
+        def transfer_on_peer(*args):
+            with closing(ResolvedHTTPSConnection(relay, connection.endpoint, context)) as channel:
+                transfer(channel, *args)
+
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            desktop_wait = workers.submit(transfer_on_peer, "wait", 200, desktop, None, request_packet)
+            deadline = monotonic() + connection.timeout
+            while monotonic() < deadline:
+                status, headers, body = fetch(connection, relay, f"{entry}/offer", headers=allowed)
+                if status == 200:
+                    require(headers["Access-Control-Allow-Origin"] == phone, "Relay offer did not allow the phone origin")
+                    cache(headers, ("no-store",), "Relay offer")
+                    require(json.loads(body) == {"ticket": ticket}, "Relay offer did not return the active ticket")
+                    break
+                if desktop_wait.done():
+                    desktop_wait.result()
+                require(status == 404, f"Relay offer returned HTTP {status}, expected 200 or 404")
+                sleep(0.05)
+            else:
+                raise ValueError("Relay wait did not make the ticket available")
+
+            phone_exchange = workers.submit(transfer_on_peer, "exchange", 200,
+                                            {**allowed, **octets}, request_packet, answer_packet)
+            completed, _ = wait((desktop_wait, phone_exchange), return_when=FIRST_COMPLETED)
+            if phone_exchange in completed:
+                phone_exchange.result()
+            desktop_wait.result()
+            transfer(connection, "answer", 204, {**desktop, **octets}, answer_packet)
+            phone_exchange.result()
+
+        status, headers, _ = fetch(connection, relay, f"{entry}/offer", headers=allowed)
+        require(status == 404 and headers["Access-Control-Allow-Origin"] == phone,
+                f"Relay offer did not close the round trip (HTTP {status})")
+        cache(headers, ("no-store",), "Relay closed offer")
+
+    def check_relay(connection):
+        allowed = {"Origin": phone}
+        unrelated = {"Origin": "https://unrelated-origin.invalid"}
+        require(fetch(connection, relay, "/mobile/")[0] == 404, "Relay host must not serve the phone entry")
+        status, headers, body = fetch(connection, relay, "/healthz", headers=allowed)
+        require(status == 200 and json.loads(body) == {"status": "ready"}, "Relay is not ready")
+        require(headers["Access-Control-Allow-Origin"] == phone, "Relay did not allow the phone origin")
+        cache(headers, ("no-store",), "Relay health")
+        status, headers, _ = fetch(connection, relay, "/healthz", method="OPTIONS", headers={
+            **allowed, "Access-Control-Request-Method": "GET",
+        })
+        require(status in (200, 204) and headers["Access-Control-Allow-Origin"] == phone,
+                "Relay preflight rejected the phone origin")
+        status, headers, _ = fetch(connection, relay, "/healthz", headers=unrelated)
+        require(status == 403 and not headers["Access-Control-Allow-Origin"], "Relay did not reject an unrelated origin")
+        cache(headers, ("no-store",), "Relay origin rejection")
+
+        # A fresh room has no offer. The relay's CORS response proves the request reached it.
+        room = token_urlsafe(32)
+        route = f"/v1/{room}/offer"
+        status, headers, _ = fetch(connection, relay, route, headers=allowed)
+        require(status == 404 and headers["Access-Control-Allow-Origin"] == phone,
+                "Relay pairing entry did not reach the relay")
+        cache(headers, ("no-store",), "Relay pairing entry")
+        status, headers, _ = fetch(connection, relay, route, headers=unrelated)
+        require(status == 403 and not headers["Access-Control-Allow-Origin"],
+                "Relay pairing entry did not reject an unrelated origin")
+        cache(headers, ("no-store",), "Relay pairing origin rejection")
+        check_relay_round_trip(connection, room, allowed)
+
+    for origin, check in ((phone, check_phone), (relay, check_relay)):
+        for endpoint in endpoints[origin]:
+            try:
+                with closing(ResolvedHTTPSConnection(origin, endpoint, context)) as connection:
+                    check(connection)
+            except ValueError as error:
+                raise ValueError(f"{origin} [{endpoint[2][0]}] {error}") from error
     return {
         "status": "passed", "phone": phone, "relay": relay, "siteFiles": len(files),
         "manifestSHA256": manifest_digest, "tlsTrust": "provided-ca" if ca_file else "system",
-        "peers": peers,
+        "peers": peers, "relayPairingEntryVerified": True, "relayRoundTripVerified": True,
     }
 
 

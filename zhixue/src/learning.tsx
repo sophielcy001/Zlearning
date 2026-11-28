@@ -11,6 +11,7 @@ import { courseHeadings, goToCourseHeading, useReadingPosition, type ReadingView
 import { refreshReminders } from './reminders';
 import { StudyTimer } from './study-timer';
 import { BackedStatus, Empty, ErrorNote, Loading, useAction, useRead } from './shared';
+import { LocalWeakPractice, studyReportUrl } from './weak-practice';
 
 const LessonAssistant = lazy(() => import('./chat').then(module => ({ default: module.LessonAssistant })));
 const LectureMarkdown = lazy(() => import('./lecture-markdown').then(module => ({ default: module.LectureMarkdown })));
@@ -322,8 +323,14 @@ const resultTitles = { passed: '独立通过', failed: '需要再练习', hinted
 
 export function ReviewPage({ active, onChange }: { active: Timer | null; onChange: () => void }) {
   const { lessonId, key } = useParams();
+  const [params] = useSearchParams();
+  const practice = params.get('practice');
   const endpoint = `/lessons/${lessonId}/reviews/${key}`;
-  const read = useRead<ReviewDetail>(endpoint);
+  const read = useRead<ReviewDetail>(practice === null ? endpoint : null);
+  if (practice !== null) {
+    const path = `${endpoint}/practice/${encodeURIComponent(practice)}`;
+    return <LocalWeakPractice key={path} endpoint={path} report={studyReportUrl(params)} />;
+  }
   if (!read.value) return <section className="page"><BackedStatus error={read.error} retry={read.refresh} /></section>;
   return <ReviewForm key={`${endpoint}/${read.value.round}`} detail={read.value} endpoint={endpoint} active={active} onChange={onChange} />;
 }

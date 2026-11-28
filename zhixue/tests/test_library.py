@@ -241,7 +241,7 @@ def test_real_previous_database_has_a_readable_pre_upgrade_backup(tmp_path):
         upgrade(engine)
         [snapshot] = list((tmp_path / "backups" / "database-upgrades").glob("*.sqlite3"))
         assert migration_state(snapshot) == ("0002_timers", 7, None)
-        assert migration_state(tmp_path / "zhixue.sqlite3") == ("0052_recognition_grants", 7, ("library_fts",))
+        assert migration_state(tmp_path / "zhixue.sqlite3") == ("0066_trash_reference_status", 7, ("library_fts",))
     finally:
         engine.dispose()
 
@@ -287,7 +287,7 @@ def test_upgrade_waits_for_the_snapshot_directory_to_sync(tmp_path, monkeypatch)
         synced.clear()
         upgrade(engine)
         assert synced == [folder, folder.parent, tmp_path]
-        assert migration_state(tmp_path / "zhixue.sqlite3") == ("0052_recognition_grants", 7, ("library_fts",))
+        assert migration_state(tmp_path / "zhixue.sqlite3") == ("0066_trash_reference_status", 7, ("library_fts",))
     finally:
         engine.dispose()
 

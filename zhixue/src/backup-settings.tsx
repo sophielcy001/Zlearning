@@ -15,6 +15,13 @@ const STATUS = {
 };
 
 const TABLES = {
+  installed_skills: '已导入的 Skills',
+  skill_versions: 'Skill 历史版本',
+  professional_agents: '专业 Agent',
+  agent_authoring_jobs: '专业 Agent 草稿',
+  local_memories: '本地记忆',
+  local_practice_attempts: '本地专项练习',
+  memory_inference_jobs: 'AI 记忆整理',
   projects: '学习项目',
   lessons: '课程',
   reviews: '复习计划',
@@ -22,6 +29,7 @@ const TABLES = {
   timers: '计时',
   imports: '导入资料',
   library_ocr_pages: '已校对扫描页和图片',
+  library_ocr_versions: '扫描资料校对版本',
   library_web_snapshots: '网页快照来源',
   note_versions: '笔记版本',
   note_conflicts: '笔记冲突',

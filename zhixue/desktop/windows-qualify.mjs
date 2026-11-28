@@ -23,8 +23,9 @@ const idleSeconds = 5;
 const shellNames = { electron: "Electron", tauri: "Tauri" };
 const shells = Object.keys(shellNames);
 const help = 'node desktop/windows-qualify.mjs --electron <已安装的 Electron exe> --electron-installer <NSIS>'
-  + ' --tauri <已安装的 Tauri exe> --tauri-installer <NSIS> [--rounds 3] [--reports <目录>] [--use-tray] [--focus-assist]'
+  + ' --tauri <已安装的 Tauri exe> --tauri-installer <NSIS> [--rounds 3] [--reports <目录>] [--use-tray] [--auto-tray] [--focus-assist]'
   + '\n单壳预验可加 --only electron 或 --only tauri，只提供对应的应用与安装程序。'
+  + '\n--auto-tray 通过 Explorer 激活已确认的图标，并在所属窗口持有焦点时发送原生键盘输入。'
   + '\n--focus-assist 等待操作者点击测试窗口取得焦点，再发送退出快捷键或 Enter。';
 
 let scriptBody;
@@ -93,9 +94,17 @@ async function timerDialog(app, choice, { useDefault = false, focusAssist = fals
   });
 }
 
-async function normalExit(app, focusAssist) {
-  await requestExit(app, focusAssist);
-  await checkExit(app);
+async function ownedProbe(script, app, executable, ...options) {
+  const file = join(root, 'desktop', script);
+  try {
+    const { stdout } = await runFile('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-File', file, '-RootId', String(app.child.pid),
+      '-Executable', executable, ...options,
+    ], { encoding: 'utf8', windowsHide: true, timeout: 20000 });
+    return JSON.parse(stdout.trim());
+  } catch (error) {
+    throw new Error(script + ' · ' + (error.stderr?.trim() || error.message), { cause: error });
+  }
 }
 
 async function checkExit(app) {
@@ -118,11 +127,35 @@ async function showAgain(app, executable, useTray) {
 
 async function trial(artifact, args, machine, round, result) {
   const focusAssist = Boolean(args['focus-assist']);
+  const autoTray = Boolean(args['auto-tray']);
   const scratch = await mkdtemp(join(tmpdir(), 'zhixue-win-qualify-'));
   const workspace = join(scratch, '学习数据');
   const webProfile = join(scratch, 'WebView2');
   await mkdir(workspace);
   let app;
+  const title = '智学 · ' + shellNames[artifact.kind];
+  const exitTitle = '智学 · 完全退出';
+  const owned = (script, ...options) => ownedProbe(script, app, artifact.executable, ...options);
+  const foreground = async () => (await native('foreground', app)).owned;
+  if (autoTray) result.nativeEvidence = { tray: [], keys: [] };
+  const activateTray = async () => {
+    const evidence = await owned('windows-activate-tray.ps1', '-Title', title);
+    result.nativeEvidence.tray.push(evidence);
+    await observed(foreground, '通知区激活后未取得测试窗口焦点。', 6000);
+  };
+  const ensureForeground = async () => {
+    if (!await foreground()) await activateTray();
+  };
+  const sendKey = async (key, target) => {
+    const evidence = await owned('windows-send-key.ps1', '-Title', target, '-Key', key);
+    assert.equal(evidence.inserted, key === 'Quit' ? 6 : 2, 'Windows 未插入完整按键序列。');
+    result.nativeEvidence.keys.push(evidence);
+  };
+  const exit = async () => {
+    if (!autoTray) return requestExit(app, focusAssist);
+    await ensureForeground();
+    await sendKey('Quit', title);
+  };
   const launch = async (firstUse) => {
     app = await openInstalled(artifact.executable, artifact.kind, workspace, webProfile, firstUse);
     await observed(async () => (await native('visible', app)).visible, '本地页面就绪后没有观察到可见的主窗口。');
@@ -138,6 +171,7 @@ async function trial(artifact, args, machine, round, result) {
     const sample = await prepareWorkspace(app, workspace);
     result.filesAndWorker = '通过';
     await wait(1000);
+    if (autoTray) await ensureForeground();
     const readSample = async () => {
       assert(!app.ended(), '桌面进程在资源测量时退出。');
       const raw = await native('snapshot', app, { WebProfile: webProfile });
@@ -145,11 +179,13 @@ async function trial(artifact, args, machine, round, result) {
     };
     result.idle = await sampleResources(readSample, idleSeconds * 1000, machine.logical, { baseline: true });
     for (const nodes of graphSizes) {
+      if (autoTray) await ensureForeground();
       const [frames, resources] = await Promise.all([
         animateGraph(app.page, nodes, graphSeconds),
         sampleResources(readSample, graphSeconds * 1000, machine.logical),
       ]);
       result.graph.push({ ...frames, resources });
+      if (autoTray) assert(await foreground(), '图谱采样期间失去测试窗口焦点。');
     }
     if (round === 1) {
       const startTimer = async () => (await app.api('/api/timer', 'POST', {
@@ -167,16 +203,22 @@ async function trial(artifact, args, machine, round, result) {
         await checkActiveTimer();
       });
       result.native.hiddenWorker = '窗口隐藏后保存了已发出的后台路线，计时继续。';
-      result.native.reopen = await showAgain(app, artifact.executable, args['use-tray']);
-      result.native.tray = args['use-tray'] ? '观察到恢复' : '未验证';
+      if (autoTray) {
+        await activateTray();
+        assert((await native('visible', app)).visible, '通知区激活后原应用窗口未恢复。');
+        result.native.reopen = '通过 Explorer 通知区域恢复原窗口';
+      } else {
+        result.native.reopen = await showAgain(app, artifact.executable, args['use-tray']);
+      }
+      result.native.tray = autoTray || args['use-tray'] ? '观察到恢复' : '未验证';
       await checkActiveTimer();
-      await requestExit(app, focusAssist);
+      await exit();
       await timerDialog(app, '取消');
       await wait(400);
       await checkActiveTimer();
       result.native.cancel = '原计时继续，桌面应用仍可访问。';
 
-      await requestExit(app, focusAssist);
+      await exit();
       await timerDialog(app, '暂存并退出');
       await checkExit(app);
       await launch(false);
@@ -187,8 +229,16 @@ async function trial(artifact, args, machine, round, result) {
       await inspectRecovery(app, sample);
 
       const second = await startTimer();
-      await requestExit(app, focusAssist);
-      await timerDialog(app, '结束计时并退出', { useDefault: true, focusAssist });
+      await exit();
+      if (autoTray) {
+        const dialog = await owned('windows-default-dialog.ps1');
+        assert.equal(dialog.DefaultCaption, '结束计时并退出', '退出对话框的默认按钮不符。');
+        assert.equal(dialog.Invoked, false);
+        result.nativeEvidence.defaultButton = dialog;
+        await sendKey('Enter', exitTitle);
+      } else {
+        await timerDialog(app, '结束计时并退出', { useDefault: true, focusAssist });
+      }
       await checkExit(app);
       await launch(false);
       const finished = await app.api('/api/timer');
@@ -204,13 +254,14 @@ async function trial(artifact, args, machine, round, result) {
       assert.equal((await app.api('/api/timer')).lastSaved?.id, second.id);
       result.native.recovery = '终止评测进程后恢复原资料、课程笔记、后台路线及已保存计时。';
     }
-    await normalExit(app, focusAssist);
+    await exit();
+    await checkExit(app);
     result.native.exit = '桌面进程和旧本地服务已退出。';
     result.state = 'measured';
   } finally {
     if (app && !app.ended()) await stopOwned(app);
     if (app) await serviceStopped(app);
-    await rm(scratch, { recursive: true, force: true });
+    await rm(scratch, { recursive: true, force: true, maxRetries: 8, retryDelay: 250 });
   }
 }
 
@@ -242,6 +293,7 @@ export function windowsReportMarkdown(report) {
     '- 可执行文件架构 ' + report.architecture + '，CPU 逻辑处理器 ' + report.machine.logical,
     '- 测量始于 ' + report.startedAt, '- 结束状态 ' + (report.state === 'complete' ? '采集完成' : report.state), '',
     ...(only ? ['本次采集 ' + only + '，同机对比待双壳采集。', ''] : []),
+    ...(report.policy?.autoTrayRequested ? ['通知区域自动激活已启用。原生按键发送前会核对安装路径和前台窗口。', ''] : []),
     ...(report.policy?.focusAssistRequested ? ['键盘焦点协助已启用。发送按键前仍须确认测试窗口持有焦点。', ''] : []),
     '## 完成轮次汇总', '',
     '| 指标 | ' + columns.join(' | ') + ' |', '| --- | ' + columns.map(() => '---:').join(' | ') + ' |',
@@ -310,7 +362,7 @@ async function main() {
       electron: { type: 'string' }, tauri: { type: 'string' }, 'electron-installer': { type: 'string' },
       'tauri-installer': { type: 'string' }, only: { type: 'string' },
       reports: { type: 'string' }, rounds: { type: 'string', default: '3' },
-      'use-tray': { type: 'boolean' }, 'focus-assist': { type: 'boolean' }, help: { type: 'boolean', short: 'h' },
+      'use-tray': { type: 'boolean' }, 'auto-tray': { type: 'boolean' }, 'focus-assist': { type: 'boolean' }, help: { type: 'boolean', short: 'h' },
     },
   });
   if (args.help) {
@@ -347,7 +399,7 @@ async function main() {
   const reportFolder = await mkdtemp(join(directory, startedAt.replace(/[:.]/g, '-') + '-'));
   const report = {
     state: 'running', startedAt, machine, architecture: installs[frameworks[0]].evidence.architecture,
-    policy: { rounds, graphSeconds, idleSeconds, trayRequested: Boolean(args['use-tray']),
+    policy: { rounds, graphSeconds, idleSeconds, trayRequested: Boolean(args['use-tray'] || args['auto-tray']), autoTrayRequested: Boolean(args['auto-tray']),
       focusAssistRequested: Boolean(args['focus-assist']),
       ...(args.only ? { only: args.only } : {}) },
     artifacts: Object.fromEntries(frameworks.map((kind) => [kind, installs[kind].evidence])), trials: [],

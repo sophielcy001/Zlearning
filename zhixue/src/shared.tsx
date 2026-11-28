@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { AlertCircle, BookOpen, LoaderCircle, Upload, X } from 'lucide-react';
 import ReactMarkdown, { type Options } from 'react-markdown';
-import { Link } from 'react-router-dom';
+import { LibraryContextLink } from './library-views';
 import remarkFrontmatter from 'remark-frontmatter';
 import { workspaceMarkdownRoute } from './markdown-links';
 import { remarkWiki } from './wiki-markdown';
@@ -83,7 +83,7 @@ export function Markdown({ children, components, remarkPlugins }: Pick<Options, 
     ...components,
     a: ({ href, children: label }) => {
       const route = workspaceMarkdownRoute(href);
-      if (route) return <Link to={route}>{label}</Link>;
+      if (route) return <LibraryContextLink to={route}>{label}</LibraryContextLink>;
       return href && /^https?:\/\//i.test(href)
         ? <a href={href} target="_blank" rel="noopener noreferrer">{label}</a> : <span>{label}</span>;
     },

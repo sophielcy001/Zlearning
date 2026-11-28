@@ -2,7 +2,9 @@ from collections.abc import Callable
 from contextlib import closing, contextmanager, suppress
 import logging
 from pathlib import Path
+from secrets import randbits
 import sqlite3
+from tempfile import NamedTemporaryFile
 from threading import Event, Lock
 from time import monotonic
 
@@ -35,20 +37,62 @@ SCORE_WINDOW = 0.045
 logger = logging.getLogger(__name__)
 
 
+@contextmanager
+def cache_writer(path: Path):
+    with closing(sqlite3.connect(path, timeout=5)) as db:
+        db.execute("PRAGMA foreign_keys=ON")
+        with db:
+            yield db
+
+
+def request_index(db: sqlite3.Connection) -> None:
+    db.execute("PRAGMA journal_mode=WAL").close()
+    db.executescript(SCHEMA)
+    db.execute("""INSERT INTO settings VALUES (1, ?, 1, NULL)
+        ON CONFLICT(id) DO UPDATE SET generation=generation+1, preparing=1, error=NULL
+        WHERE preparing=0 OR error IS NOT NULL""", ((1 << 61) | randbits(61),))
+
+
+def reset_index(db: sqlite3.Connection) -> None:
+    db.executescript(SCHEMA)
+    state = db.execute("SELECT preparing FROM settings WHERE id=1").fetchone()
+    if state is None:
+        request_index(db)
+        return
+    db.execute("DELETE FROM passages")
+    db.execute("UPDATE settings SET generation=generation+1, error=NULL WHERE id=1")
+
+
+def corrupt_cache(error: sqlite3.DatabaseError) -> bool:
+    code = getattr(error, "sqlite_errorcode", 0) & 255
+    return code in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB}
+
+
 class SemanticIndex:
     def __init__(self, folder: Path):
         self.database = folder / "zhixue.sqlite3"
-        directory = folder / ".semantic"
+        directory = folder.resolve() / ".semantic"
         self.cache = directory / "e5-small-v1.sqlite3"
+        self.lease = directory / "cache-lease.sqlite3"
         self.assets = directory / "multilingual-e5-small"
         self.encoder = None
         self.encoder_lock = Lock()
         self.next_prune = 0.0
 
     @contextmanager
+    def _lease(self, *, replace: bool = False):
+        # Ordinary access takes a shared lock. Replacement waits until both
+        # the app and worker have released their SQLite handles to the cache.
+        if self.lease.resolve() != self.lease:
+            raise OSError("Cannot safely open the semantic cache lease.")
+        with closing(sqlite3.connect(self.lease, timeout=5)) as lease:
+            lease.execute("BEGIN EXCLUSIVE" if replace else "BEGIN")
+            lease.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+            yield
+
+    @contextmanager
     def _catalog(self):
-        # The model cache lives alongside the workspace, outside database and library backups.
-        with closing(sqlite3.connect(sqlite_file_uri(self.database, mode="ro"), uri=True, timeout=3)) as db:
+        with self._lease(), closing(sqlite3.connect(sqlite_file_uri(self.database, mode="ro"), uri=True, timeout=3)) as db:
             db.row_factory = sqlite3.Row
             db.create_function("unicode_fold", 1, str.casefold, deterministic=True)
             db.execute("ATTACH DATABASE ? AS semantic", (sqlite_file_uri(self.cache, mode="ro"),))
@@ -57,27 +101,62 @@ class SemanticIndex:
 
     @contextmanager
     def _write(self):
-        with closing(sqlite3.connect(self.cache, timeout=5)) as db:
-            db.execute("PRAGMA foreign_keys=ON")
-            with db:
-                yield db
+        with self._lease(), cache_writer(self.cache) as db:
+            yield db
+
+    def _publish_preparing_cache(self) -> None:
+        sidecars = [self.cache.with_name(self.cache.name + suffix) for suffix in ("-wal", "-shm", "-journal")]
+        for path in [self.cache, *sidecars]:
+            if path.resolve() != path or (path.exists() and not path.is_file()):
+                raise OSError("Cannot safely replace the semantic cache.")
+        with NamedTemporaryFile(prefix=".semantic-rebuild-", dir=self.cache.parent, delete=False) as temp:
+            candidate = Path(temp.name)
+        try:
+            with cache_writer(candidate) as db:
+                # Do not accept a batch computed for any previous cache generation.
+                request_index(db)
+            for path in sidecars:
+                path.unlink(missing_ok=True)
+            candidate.replace(self.cache)
+        finally:
+            candidate.unlink(missing_ok=True)
+
+    def _modify_cache(self, operation: Callable[[sqlite3.Connection], None]) -> None:
+        try:
+            with self._write() as db:
+                operation(db)
+        except sqlite3.DatabaseError as error:
+            if not corrupt_cache(error):
+                raise
+            with self._lease(replace=True):
+                try:
+                    # Another request may already have repaired the cache.
+                    with cache_writer(self.cache) as db:
+                        operation(db)
+                except sqlite3.DatabaseError as locked_error:
+                    if not corrupt_cache(locked_error):
+                        raise
+                    self._publish_preparing_cache()
+
+    def _initialize_cache(self) -> bool:
+        if self.cache.is_file():
+            return False
+        with self._lease(replace=True):
+            if self.cache.is_file():
+                return False
+            # Readers must first see the cache after SQLite has closed the committed file.
+            self._publish_preparing_cache()
+            return True
 
     def request(self) -> dict:
         self.cache.parent.mkdir(parents=True, exist_ok=True)
-        with self._write() as db:
-            db.execute("PRAGMA journal_mode=WAL").close()
-            db.executescript(SCHEMA)
-            db.execute("""INSERT INTO settings VALUES (1, 1, 1, NULL)
-                ON CONFLICT(id) DO UPDATE SET generation=generation+1, preparing=1, error=NULL
-                WHERE preparing=0 OR error IS NOT NULL""")
+        if not self._initialize_cache():
+            self._modify_cache(request_index)
         return self.status()
 
     def rebuild(self) -> None:
-        if not self.cache.is_file():
-            return
-        with self._write() as db:
-            db.execute("DELETE FROM passages")
-            db.execute("UPDATE settings SET generation=generation+1, error=NULL WHERE id=1")
+        if self.cache.is_file():
+            self._modify_cache(reset_index)
 
     def status(self) -> dict:
         if not self.cache.is_file():
@@ -149,7 +228,8 @@ class SemanticIndex:
         stale = catalog.execute("""SELECT s.key FROM semantic.passages s
             WHERE NOT EXISTS (SELECT 1 FROM library_passages p WHERE p.semantic_key=s.key) LIMIT 192""").fetchall()
         if stale:
-            with self._write() as db:
+            # The catalog already holds a shared cache lease.
+            with cache_writer(self.cache) as db:
                 db.executemany("DELETE FROM passages WHERE key=?", stale)
 
     def hybrid(self, query: str, scope: dict, fallback: Callable[[], dict]) -> dict:
@@ -166,7 +246,8 @@ class SemanticIndex:
             except Exception as error:
                 logger.warning("Hybrid search failed (%s)", type(error).__name__)
                 status = progress("failed", message=INDEX_ERROR)
-        return {**merge_hits(fallback() if exact is None else exact, nearby), "semantic": status}
+        matches = merge_hits(fallback() if exact is None else exact, nearby, recent=scope["shelf"] == "recent")
+        return {**matches, "semantic": status}
 
 
 def settings(db):
@@ -205,25 +286,36 @@ def pending_passages(db):
     return batch
 
 
+def view_recency(order: int | None, visited_at: str | None) -> tuple[int, str]:
+    return order or 0, visited_at or ""
+
+
 def semantic_hits(db, scope: dict, query_vector) -> list[dict]:
     import numpy as np
 
-    cursor = db.execute(f"""SELECT p.id, v.start, v.end, v.vector FROM {SOURCE}
+    recent = scope["shelf"] == "recent"
+    cursor = db.execute(f"""SELECT p.id, v.start, v.end, v.vector, a.last_viewed_order, a.last_viewed_at FROM {SOURCE}
         JOIN semantic.vectors v ON v.key=p.semantic_key {METADATA_JOIN}
         WHERE {SEARCH_FILTERS}""", scope)
     candidates = {}
+    visits = {}
     for batch in iter(lambda: cursor.fetchmany(1024), []):
         vectors = np.frombuffer(b"".join(row[3] for row in batch), dtype="<f4").reshape(-1, DIMENSIONS)
         scores = vectors @ query_vector
         for index in np.flatnonzero(scores >= SCORE_MINIMUM):
-            identity, start, end, _ = batch[index]
+            identity, start, end, _, viewed_order, viewed_at = batch[index]
             score = float(scores[index])
             candidate = (score, -start, end)
             if identity not in candidates or candidate > candidates[identity]:
                 candidates[identity] = candidate
+                if recent:
+                    visits[identity] = view_recency(viewed_order, viewed_at)
     minimum = max((value[0] for value in candidates.values()), default=SCORE_MINIMUM) - SCORE_WINDOW
-    best = sorted((identity for identity, value in candidates.items() if value[0] >= minimum),
-                  key=lambda identity: (-candidates[identity][0], identity))[:MAX_HITS + 1]
+    eligible = sorted((identity for identity, value in candidates.items() if value[0] >= minimum),
+                      key=lambda identity: (-candidates[identity][0], identity))
+    if recent:
+        eligible.sort(key=visits.__getitem__, reverse=True)
+    best = eligible[:MAX_HITS + 1]
     if not best:
         return []
     keys = ",".join("?" for _ in best)
@@ -237,16 +329,19 @@ def semantic_hits(db, scope: dict, query_vector) -> list[dict]:
         body = row["body"]
         start = -offset
         stop = min(start + 170, end)
-        snippet = ("…" if start else "") + " ".join(body[start:stop].split()) + ("…" if stop < len(body) else "")
+        prefix = "…" if start else ""
+        snippet = prefix + " ".join(body[start:stop].split()) + ("…" if stop < len(body) else "")
+        window = prefix + body[start:end].strip() + ("…" if end < len(body) else "")
         hits.append({
             **document_info(row),
             "location": location_info(row["position"], row["label"], row["text_revision"]) if row["position"] else None,
             "snippet": snippet,
+            **({"semanticExcerpt": window} if window != snippet else {}),
         })
     return hits
 
 
-def merge_hits(exact: dict, related: list[dict]) -> dict:
+def merge_hits(exact: dict, related: list[dict], *, recent: bool) -> dict:
     hits = {}
     scores = {}
     for match, source, weight in (("keyword", exact["hits"], 1.5), ("semantic", related, 1)):
@@ -254,8 +349,15 @@ def merge_hits(exact: dict, related: list[dict]) -> dict:
             identity = hit["id"], hit["location"]["number"] if hit["location"] else 0
             scores[identity] = scores.get(identity, 0) + weight / (20 + rank)
             if identity in hits:
-                hits[identity]["match"] = "both"
+                combined = hits[identity]
+                combined["match"] = "both"
+                semantic_excerpt = hit.get("semanticExcerpt", hit["snippet"])
+                if semantic_excerpt != combined["snippet"]:
+                    combined["semanticExcerpt"] = semantic_excerpt
             else:
                 hits[identity] = {**hit, "match": match}
     order = sorted(hits, key=scores.__getitem__, reverse=True)
+    if recent:
+        order.sort(key=lambda identity: view_recency(hits[identity].get("lastViewedOrder"), hits[identity]["lastViewedAt"]),
+                   reverse=True)
     return {"hits": [hits[key] for key in order[:MAX_HITS]], "hasMore": exact["hasMore"] or len(order) > MAX_HITS}

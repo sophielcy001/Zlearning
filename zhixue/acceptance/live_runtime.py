@@ -12,7 +12,7 @@ from backend.app import create_app
 from backend.db import open_db
 from backend.launch import serve
 from backend.model_costs import MoneyLimit
-from backend.model_protocols import post_json
+from backend.model_protocols import TransportNotSent, post_json
 from backend.process_io import watch_parent_disconnect
 from backend.worker import run_queue
 
@@ -41,17 +41,23 @@ class MemoryCredentials:
         self.values.pop(reference, None)
 
 
-def capped_transport(limit: int, before_send=None):
+def capped_transport(limit: int, before_send=None, *, stopped: Event | None = None):
     lock = Lock()
+
+    def check_stopped():
+        if stopped is not None and stopped.is_set():
+            raise TransportNotSent()
 
     def send(address, headers, payload):
         nonlocal limit
         with lock:
+            check_stopped()
             if limit <= 0:
                 return 429, b""
             limit -= 1
         if before_send is not None:
             before_send()
+        check_stopped()
         return post_json(address, headers, payload)
 
     return send
@@ -129,7 +135,7 @@ def main():
                 except (OSError, SQLAlchemyError):
                     print("无法保存隔离模型用量快照。", file=sys.stderr)
 
-    transport = capped_transport(args.limit, checkpoint)
+    transport = capped_transport(args.limit, checkpoint, stopped=stopped)
 
     worker = None
 
@@ -138,7 +144,12 @@ def main():
         worker = SampleWorker(data, server, vault, transport, args.cost_limit)
         return worker
 
-    watch_parent_disconnect(stopped.set)
+    def stop_on_disconnect():
+        stopped.set()
+        if worker is not None:
+            worker.stopped.set()
+
+    watch_parent_disconnect(stop_on_disconnect)
     service_stopped = False
     try:
         with socket.socket() as listener:

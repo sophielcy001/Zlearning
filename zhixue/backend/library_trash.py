@@ -5,12 +5,12 @@ import os
 from pathlib import Path
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.orm import Session
 
-from .db import LibraryLocation, LibraryOcrPage, LibraryTrash, transaction
+from .db import LibraryLocation, LibraryOcrPage, LibraryOcrVersion, LibraryTrash, transaction
 from .file_locations import FileIdentity, InvalidLocation, LocationConflict, LocationTracker, checked_path, identity_of
-from .library import file_signature
+from .library import file_signature, wiki_target_key
 
 
 PENDING = ("deleting", "restoring", "purging")
@@ -21,6 +21,7 @@ VISIBLE = ("trashed", *PENDING)
 class FileVersion:
     identity: FileIdentity
     revision: str
+    signature: str
 
 
 def file_version(path: Path) -> FileVersion | None:
@@ -32,7 +33,7 @@ def file_version(path: Path) -> FileVersion | None:
         revision = file_digest(handle, "sha256").hexdigest()
     if file_signature(path) != before or identity_of(path) != identity:
         raise LocationConflict("文件正在变化，请刷新后重试。")
-    return FileVersion(identity, revision)
+    return FileVersion(identity, revision, before)
 
 
 def archive_path(folder: Path, entry: LibraryTrash) -> Path:
@@ -185,6 +186,11 @@ def complete_restore(db: Session, folder: Path, entry: LibraryTrash) -> None:
         unlink_archive(archive)
     tracker.bind(entry.file_id, destination, current.identity, current.revision)
     release_location(db, entry)
+    if entry.restore_path != entry.original_path:
+        # Legacy trash entries still record the exact original path, even without a saved title alias.
+        paths = (entry.original_path, entry.original_path.removeprefix("library/"))
+        db.execute(text("INSERT OR IGNORE INTO library_wiki_aliases (file_id, key) VALUES (:id, :key)"),
+                   [{"id": entry.file_id, "key": wiki_target_key(path)} for path in paths])
     entry.state, entry.error = "restored", None
 
 
@@ -234,6 +240,7 @@ def finish_operation(db: Session, folder: Path, entry: LibraryTrash) -> None:
             complete_purge(folder, entry)
             if entry.state == "purged":
                 db.execute(delete(LibraryOcrPage).where(LibraryOcrPage.file_id == entry.file_id))
+                db.execute(delete(LibraryOcrVersion).where(LibraryOcrVersion.file_id == entry.file_id))
     except (OSError, InvalidLocation, LocationConflict) as error:
         entry.error = str(error) if isinstance(error, (InvalidLocation, LocationConflict)) else "文件暂时无法移动或清理。请检查文件占用和目录权限。"
 

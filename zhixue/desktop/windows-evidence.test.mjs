@@ -165,3 +165,17 @@ test('idle CPU still has a sampling interval after a slow first Windows snapshot
   assert.equal(result.observedIntervalMs, 600);
   assert.equal(result.cpuMeanPercent, 0.5);
 });
+
+test('records automatic Explorer activation in the Windows benchmark report', async () => {
+  const { windowsReportMarkdown } = await import('./windows-qualify.mjs');
+  const report = {
+    machine: { os: 'Windows', build: 'test', logical: 8 },
+    architecture: 'x64', startedAt: '2026-11-21T00:00:00Z', state: 'complete',
+    policy: { trayRequested: true, autoTrayRequested: true },
+    artifacts: { electron: { setup: { bytes: 100 }, installedBytes: 200 } },
+    trials: [], comparability: { nativeTrayVerified: true },
+  };
+  assert.match(windowsReportMarkdown(report), /通知区域自动激活已启用/);
+  assert.doesNotMatch(windowsReportMarkdown({ ...report, policy: { trayRequested: true } }), /通知区域自动激活已启用/);
+});
+

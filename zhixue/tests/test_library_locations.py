@@ -3,12 +3,14 @@ import os
 from shutil import copyfile
 import sqlite3
 
+import pytest
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
 
 from backend.app import create_app
 from backend.db import ROOT, open_db
+from backend.file_locations import identity_of
 from backend.worker import prepare_one
 
 
@@ -210,3 +212,28 @@ def test_upgrade_recovers_previously_indexed_file_moved_before_first_new_startup
     [backup] = list((tmp_path / "backups" / "database-upgrades").glob("*.sqlite3"))
     with sqlite3.connect(backup) as db:
         assert db.execute("SELECT version_num FROM alembic_version").fetchone() == ("0005_note_versions",)
+
+
+def test_returned_original_allows_a_later_atomic_edit(tmp_path):
+    with app(tmp_path) as http:
+        identity = upload(http, "暂移资料.txt", b"Original")
+        endpoint = f"/api/files/{identity}"
+        original = tmp_path / get(http, endpoint)["path"]
+        if identity_of(original).birth is None:
+            pytest.skip("Requires a filesystem that reports creation time")
+
+        parked = tmp_path / "parked.txt"
+        original.rename(parked)
+        assert get(http, endpoint)["status"] == "missing"
+        parked.write_bytes(b"Edited away from the library")
+        parked.rename(original)
+        returned = get(http, endpoint)
+        assert returned["content"] == "Edited away from the library"
+
+        replacement = original.with_suffix(".tmp")
+        replacement.write_bytes(b"Edited atomically after returning")
+        replacement.replace(original)
+        edited = get(http, endpoint)
+        assert edited["id"] == identity
+        assert edited["content"] == "Edited atomically after returning"
+        assert edited["revision"] != returned["revision"]

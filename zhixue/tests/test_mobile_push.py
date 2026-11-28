@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 from hashlib import sha256
 import json
@@ -70,6 +71,40 @@ def test_fixed_appointment_push_survives_restart_and_shares_one_receipt(tmp_path
         engine.dispose()
 
 
+def test_a_rebooked_slot_rejects_the_old_push_acknowledgement(tmp_path):
+    now = datetime(2027, 1, 31, 11)
+    engine = open_db(tmp_path)
+    try:
+        with local_app(tmp_path, lambda: now) as http:
+            first_lesson(http, tmp_path)
+            plan = accepted(http.get("/api/study-plan"))
+            task = plan["days"][0]["tasks"][0]
+            move, result = preview(http, task, plan["today"], "19:00")
+            accepted(confirm(http, move, result))
+            old = reserve(engine, tmp_path, now)
+            assert old is not None
+
+            move, result = preview(http, task)
+            accepted(confirm(http, move, result))
+            move, result = preview(http, task, plan["today"], "19:00")
+            accepted(confirm(http, move, result))
+            settle_push(engine, old, delivered=True)
+
+            replacement = reserve(engine, tmp_path, now)
+            assert replacement is not None and replacement.id != old.id
+            settle_push(engine, old, delivered=False)
+            assert reserve(engine, tmp_path, now) == replacement
+            settle_push(engine, replacement, delivered=True)
+            assert check(http)["reminders"] == []
+            recovered = accepted(http.post("/api/mobile/reminders/check", json={
+                "workspace": replacement.workspace, "trigger": "foreground", "notice": replacement.id,
+            }))
+            card, = recovered["reminders"]
+            assert card["lessonId"] == task["lessonId"]
+    finally:
+        engine.dispose()
+
+
 def test_push_honors_quiet_hours_and_does_not_claim_unrequested_daily_or_tomorrow(tmp_path):
     now = datetime(2027, 1, 30, 10, 30)
     engine = open_db(tmp_path)
@@ -127,6 +162,7 @@ def test_sender_uses_encrypted_web_push_and_releases_a_rejected_claim(tmp_path, 
     class Pair:
         gate = staticmethod(lambda: None)
         current_push = staticmethod(lambda: target)
+        hold_push_target = staticmethod(lambda _: nullcontext(True))
         expire_push = staticmethod(expired.append)
 
     sender.http.request = receive
@@ -170,6 +206,100 @@ def test_sender_uses_encrypted_web_push_and_releases_a_rejected_claim(tmp_path, 
         engine.dispose()
 
 
+@pytest.mark.parametrize(("change_target", "provider_result"), [
+    ("unsubscribe", "accepted"), ("replacement", "uncertain"),
+])
+def test_late_push_completion_for_a_retired_target_releases_reminder(tmp_path, change_target, provider_result):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    from backend.db import transaction
+    from backend.mobile_api import workspace_id
+    from backend.mobile_cipher import token
+    from backend.mobile_pairing import DesktopPairing, Link
+    from test_model_settings import TestVault
+
+    now = datetime(2027, 1, 31, 10, 59)
+    engine = open_db(tmp_path)
+    started, respond = Event(), Event()
+    sent = []
+
+    def workspace():
+        with transaction(engine, write=False) as db:
+            return workspace_id(db)
+
+    desktop = DesktopPairing(tmp_path, TestVault(), workspace, lambda _: None, lambda: None)
+
+    def register(suffix):
+        browser = ec.generate_private_key(ec.SECP256R1())
+        subscription = PushSubscription(
+            endpoint=f"https://fcm.googleapis.com/fcm/send/{suffix}",
+            keys={"p256dh": public_key(browser), "auth": encode(bytes(16))},
+        )
+        registration = PushRegistration.create().model_copy(update={"subscription": subscription})
+        link = Link("https://relay.example.test", token(), bytes(32), workspace(), suffix)
+        with desktop.lock:
+            desktop.save_link(link, registration)
+            desktop.pair = link
+        return link
+
+    def send(target, payload, ttl):
+        sent.append((target, payload))
+        if len(sent) == 1:
+            started.set()
+            assert respond.wait(5), "Test did not complete the target change"
+            return provider_result
+        return "accepted"
+
+    try:
+        with local_app(tmp_path, lambda: now) as http, ThreadPoolExecutor(max_workers=1) as pool:
+            first_lesson(http, tmp_path)
+            plan = accepted(http.get("/api/study-plan"))
+            task = plan["days"][0]["tasks"][0]
+            change, result = preview(http, task, plan["today"], "19:00")
+            accepted(confirm(http, change, result))
+            original = register("previous")
+            target = desktop.current_push()
+            push = MobilePush(desktop, engine, tmp_path, lambda db: now.date(), lambda: now,
+                              sender=SimpleNamespace(send=send))
+            now += timedelta(minutes=1)
+            in_flight = pool.submit(push.tick)
+            try:
+                assert started.wait(5), "Push did not reach the provider"
+                if change_target == "unsubscribe":
+                    disabled = desktop.handle(original, {"op": "push-unsubscribe", "workspace": original.workspace,
+                                                         "endpointId": target.subscription.fingerprint})
+                    assert disabled["status"] == 200 and not disabled["data"]["registered"]
+                else:
+                    assert desktop.revoke()["paired"] is None
+                    register("current")
+                assert desktop.current_push() != target
+            finally:
+                respond.set()
+            in_flight.result(timeout=5)
+            assert sent[0][0] == target
+            if change_target == "unsubscribe":
+                reminder, = check(http)["reminders"]
+                assert reminder["lessonId"] == task["lessonId"]
+                assert check(http)["reminders"] == []
+            else:
+                push.tick()
+                assert len(sent) == 2
+                replacement, payload = sent[1]
+                assert replacement == desktop.current_push() and replacement != target
+                assert payload["lessonId"] == task["lessonId"]
+                assert payload["delivery"] != sent[0][1]["delivery"]
+                arrival = accepted(http.post("/api/mobile/reminders/check", json={
+                    "workspace": payload["workspace"], "trigger": "foreground", "notice": payload["delivery"],
+                }))
+                reminder, = arrival["reminders"]
+                assert reminder["lessonId"] == task["lessonId"]
+                assert check(http)["reminders"] == []
+    finally:
+        desktop.close()
+        engine.dispose()
+
+
 def test_web_push_retry_replays_the_same_encrypted_delivery_after_lost_confirmation(tmp_path, monkeypatch):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from threading import Thread
@@ -199,7 +329,8 @@ def test_web_push_retry_replays_the_same_encrypted_delivery_after_lost_confirmat
         def log_message(self, *_args):
             pass
 
-    pair = SimpleNamespace(gate=lambda: None, current_push=lambda: target, expire_push=lambda _: None)
+    pair = SimpleNamespace(gate=lambda: None, current_push=lambda: target,
+                           hold_push_target=lambda _: nullcontext(True), expire_push=lambda _: None)
     with ThreadingHTTPServer(("127.0.0.1", 0), Provider) as provider:
         thread = Thread(target=provider.serve_forever, daemon=True)
         thread.start()

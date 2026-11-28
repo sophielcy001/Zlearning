@@ -3,6 +3,7 @@ import { api, type ProjectOption } from './api';
 import type { ModelFailover } from './model-backup';
 import { useAction } from './shared';
 import type { Citation, Reviewer } from './verification';
+import type { McpReference } from './repository-mcp';
 
 export const EXAMPLE_MESSAGE = '我想系统学习 SQLite，从学习记录中筛选数据。';
 
@@ -13,7 +14,18 @@ export type LessonAnswer = {
   support: 'grounded' | 'insufficient' | 'unverified' | null;
   citations: Citation[]; recipient: Reviewer | null; error: string | null; failovers?: ModelFailover[];
 };
+export type ChatSkillTrace = { name: string; checksum: string; position: number; version: string | null; declaredTools: string | null };
+export type ChatKnowledge = { excerpts: { id: string; path: string; name: string; number: number; label: string; excerpt: string }[] };
+export type MemoryScope = 'shared' | 'private';
+export type MemorySelection = { id: string; revision: number; scope: MemoryScope; text: string };
+export type ChatAgentTrace = {
+  id: string; name: string; skill: ChatSkillTrace | null; skillMode?: 'automatic'; knowledge?: ChatKnowledge;
+  memories?: (Omit<MemorySelection, 'text'> & { checksum: string })[];
+  mcp?: McpReference;
+};
+
 export type ModelChatReply = {
+  agent?: ChatAgentTrace;
   questionId: string; questionText: string; hasHistory: boolean;
   state: 'queued' | 'running' | 'blocked' | 'answered';
   recipient: Reviewer; error: string | null; errorCode: string | null;

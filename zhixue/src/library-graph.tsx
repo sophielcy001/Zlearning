@@ -8,7 +8,7 @@ import { KIND_LABELS, matchesView, nodeMatches, normalizeSearch, studyLabels, ty
 import { clampPoint, graphScene, type Glyph } from './graph-scene';
 import { GraphTransfer } from './graph-transfer';
 import { GRAPH_RECOMMENDATIONS, GraphReviewPanel, RecommendationDialog } from './graph-recommendations';
-import { LibraryViewSwitch } from './library-views';
+import { libraryFileUrl, LibraryViewSwitch } from './library-views';
 import { BackedStatus, ErrorNote, useAction, useRead } from './shared';
 import './graph.css';
 
@@ -73,17 +73,16 @@ function useSavedView(initial: GraphView) {
   return { view, update, error, flush };
 }
 
-function openUrl(node: GraphNode) {
+function openUrl(node: GraphNode, params: URLSearchParams) {
   if (node.lessonId) return courseUrl(node.lessonId);
-  const params = new URLSearchParams({ file: node.id });
-  if (node.kind === 'note' && node.fileStatus !== 'missing') params.set('edit', '1');
-  return '/library?' + params.toString();
+  return libraryFileUrl(params, { file: node.id, ...(node.kind === 'note' && node.fileStatus !== 'missing' && { edit: '1' }) });
 }
 
 function NodeSummary({ node, linked, choose, hide, edit, pending }: {
   node: GraphNode; linked: { node: GraphNode; edge: GraphEdge }[]; choose: (node: GraphNode) => void;
   hide: () => void; edit: (edge?: GraphEdge) => void; pending: boolean;
 }) {
+  const [params] = useSearchParams();
   const status = studyLabels(node);
   return <>
     <div className="graph-inspector-heading">
@@ -97,7 +96,7 @@ function NodeSummary({ node, linked, choose, hide, edit, pending }: {
     {node.excerpt && <p className="graph-excerpt">{node.excerpt}</p>}
     {node.path && <p className="graph-file-path">{node.path}</p>}
     <div className="action-row graph-node-open">
-      <Link className="button primary" to={openUrl(node)}>{node.lessonId ? '打开课程' : node.kind === 'note' ? '打开笔记' : '打开文件'}</Link>
+      <Link className="button primary" to={openUrl(node, params)}>{node.lessonId ? '打开课程' : node.kind === 'note' ? '打开笔记' : '打开文件'}</Link>
       {node.review && <Link className="button secondary" to={reviewUrl(node.review)}>去复习</Link>}
     </div>
     <div className="graph-neighbor-heading"><h3>关联节点</h3>
@@ -128,6 +127,7 @@ function useReducedMotion() {
 }
 
 function GraphWorkspace({ initial, openReview }: { initial: GraphData; openReview: boolean }) {
+  const [params] = useSearchParams();
   const [data, setData] = useState(initial);
   const [query, setQuery] = useState('');
   const [dialog, setDialog] = useState<Dialog>();
@@ -267,7 +267,7 @@ function GraphWorkspace({ initial, openReview }: { initial: GraphData; openRevie
   }
 
   function openGlyph(glyph: Glyph) {
-    if (glyph.node) navigate(openUrl(glyph.node));
+    if (glyph.node) navigate(openUrl(glyph.node, params));
     if (glyph.groupId) {
       const current = data.groups.find(item => item.id === glyph.groupId);
       if (current && view.collapsed.includes(current.id)) collapse(current);

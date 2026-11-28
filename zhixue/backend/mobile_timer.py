@@ -1,16 +1,16 @@
 """Phone timer operations and reconciliation against the workspace timeline."""
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException
 from fastapi.encoders import jsonable_encoder
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from .content import lesson_course
 from .daily_plan import freeze_plan_baseline
-from .db import Lesson, MobileChange, Project, Timer, TimerSpan, transaction
+from .db import Lesson, MobileChange, Project, StudyPlanSnapshot, Timer, TimerSpan, transaction
 from .mobile_api import Change, previous, workspace_id
 from .project_activity import study_moment
 from .study_time import Activity, record_interval
@@ -117,8 +117,14 @@ def account_span(db, timer: Timer, span: PhoneSpan, now: datetime) -> tuple[dict
     if end <= start:
         return {"state": "saved", "seconds": 0}, []
     available, overlaps = split_overlap(db, timer, start, end, now.replace(microsecond=0))
+    recorded_days: set[date] = set()
     for left, right in available:
-        record_interval(db, timer, left, right, shift)
+        recorded_days.update(record_interval(db, timer, left, right, shift))
+    if recorded_days:
+        # A replay can preserve a saved plan, but cannot reconstruct an earlier schedule.
+        db.execute(update(StudyPlanSnapshot).where(
+            StudyPlanSnapshot.day.in_(recorded_days), StudyPlanSnapshot.frozen.is_(False),
+        ).values(frozen=True))
     added = sum(int((right - left).total_seconds()) for left, right in available)
     timer.elapsed += added
     result = {"state": "held", "reason": "overlap"} if overlaps else {"state": "saved"}

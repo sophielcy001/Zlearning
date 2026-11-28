@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { mobileRequest } from './mobile-data';
-import { PairingChanged, pendingPushRemoval, phonePair, savePushRemoval } from './mobile-store';
+import { acknowledgePushRemoval, PairingChanged, phonePair, phonePushState, queuePushRemoval,
+  rememberPushRegistration, type PhonePushState } from './mobile-store';
 import type { PushNotice, PushStatus } from './reminder-data';
 import { ErrorNote, useAction } from './shared';
 
@@ -28,9 +29,7 @@ export async function phoneNoticeMatchesPair(notice: PushNotice): Promise<boolea
   // Untagged links can still open local content on an unpaired device.
   if (!notice.pairing) return !pair;
   if (!pair || pair.invitation) return false;
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(pair.room));
-  const tag = Array.from(new Uint8Array(digest), value => value.toString(16).padStart(2, '0')).join('');
-  return tag === notice.pairing;
+  return await fingerprint(pair.room) === notice.pairing;
 }
 
 function noticeRoute() {
@@ -74,11 +73,13 @@ function applicationKey(encoded: string) {
   return Uint8Array.from(atob(encoded.replace(/-/g, '+').replace(/_/g, '/')), character => character.charCodeAt(0));
 }
 
+async function fingerprint(value: string) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+}
 async function localSubscription(subscription: PushSubscription | null) {
   if (!subscription) return undefined;
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(subscription.endpoint));
-  const id = Array.from(new Uint8Array(digest), value => value.toString(16).padStart(2, '0')).join('');
-  return { subscription, id };
+  return { subscription, id: await fingerprint(subscription.endpoint) };
 }
 
 export async function browserPushSubscription() {
@@ -87,30 +88,53 @@ export async function browserPushSubscription() {
   return registration?.pushManager.getSubscription();
 }
 
-const removals = new Map<string, Promise<PushStatus | undefined>>();
+export async function dismissPhoneReminders(room: string, registration?: ServiceWorkerRegistration) {
+  if (!supported) return;
+  try {
+    const worker = registration ?? await navigator.serviceWorker.getRegistration('/mobile/');
+    if (!worker) return;
+    const pairing = await fingerprint(room);
+    for (const notification of await worker.getNotifications()) {
+      const notice = readPhoneNotice(notification.data);
+      if (notice?.pairing === pairing && notification.tag === 'zhixue-' + notice.delivery) notification.close();
+    }
+  } catch {
+    // A browser's notification center may be unavailable while a subscription is still removable.
+  }
+}
 
-export function synchronizePushRemoval(room: string, workspace?: string) {
+const removals = new Map<string, { workspace?: string; sync: Promise<PushStatus | undefined> }>();
+
+export function synchronizePushRemoval(room: string, workspace?: string): Promise<PushStatus | undefined> {
   const active = removals.get(room);
-  if (active) return active;
+  if (active) {
+    // A reconnect must finish the desktop removal after a local-only operation.
+    if (workspace && !active.workspace) return active.sync.then(() => synchronizePushRemoval(room, workspace));
+    return active.sync;
+  }
   const sync = (async () => {
-    const endpointId = await pendingPushRemoval(room);
-    if (!endpointId) return;
+    const { pending } = await phonePushState(room);
+    if (!pending.length) return;
     const pair = await phonePair();
     if (!pair || pair.room !== room || pair.invitation) return;
     const registration = supported ? await navigator.serviceWorker.getRegistration('/mobile/') : undefined;
     const manager = registration?.pushManager;
     const local = manager ? await localSubscription(await manager.getSubscription()) : undefined;
-    if (manager && local?.id === endpointId && !await local.subscription.unsubscribe()) {
+    if (registration && (!local || pending.includes(local.id))) await dismissPhoneReminders(room, registration);
+    if (manager && local && pending.includes(local.id) && !await local.subscription.unsubscribe()) {
       const remaining = await localSubscription(await manager.getSubscription());
-      if (remaining?.id === endpointId) throw new Error('浏览器暂未完成停用手机推送。');
+      if (remaining?.id === local.id) throw new Error('浏览器暂未完成停用手机推送。');
     }
     if (!workspace) return;
-    const status = await mobileRequest<PushStatus>({ op: 'push-unsubscribe', workspace, endpointId }, room);
-    if (status.endpointId === endpointId) throw new Error('电脑暂未完成撤销手机推送。');
-    await savePushRemoval(room, endpointId, true);
+    let status: PushStatus | undefined;
+    for (const endpointId of pending) {
+      status = await mobileRequest<PushStatus>({ op: 'push-unsubscribe', workspace, endpointId }, room);
+      if (status.endpointId === endpointId) throw new Error('电脑暂未完成撤销手机推送。');
+      await acknowledgePushRemoval(room, endpointId, status.endpointId);
+    }
     return status;
   })().finally(() => removals.delete(room));
-  removals.set(room, sync);
+  removals.set(room, { workspace, sync });
   return sync;
 }
 
@@ -119,7 +143,8 @@ export function PhonePushSettings({ room, workspace, syncVersion }: { room: stri
   const [worker, setWorker] = useState<ServiceWorkerRegistration>();
   const [local, setLocal] = useState<Awaited<ReturnType<typeof localSubscription>>>();
   const [remote, setRemote] = useState<PushStatus>();
-  const [pending, setPending] = useState<string>();
+  const [saved, setSaved] = useState<PhonePushState>({ endpointId: null, pending: [] });
+  const pending = saved.pending.length > 0;
   const [statusError, setStatusError] = useState('');
   const [revision, setRevision] = useState(0);
   const action = useAction();
@@ -132,14 +157,16 @@ export function PhonePushSettings({ room, workspace, syncVersion }: { room: stri
     void (async () => {
       const registration = await navigator.serviceWorker.ready;
       const subscription = await localSubscription(await registration.pushManager.getSubscription());
-      const pending = await pendingPushRemoval(room);
-      if (live) { setWorker(registration); setLocal(subscription); setPending(pending); }
+      const saved = await phonePushState(room);
+      if (live) { setWorker(registration); setLocal(subscription); setSaved(saved); }
       if (!workspace) return;
-      const status = (pending ? await synchronizePushRemoval(room, workspace) : undefined) ??
-        await mobileRequest<PushStatus>({ op: 'push-status', workspace }, room);
-      const remaining = await pendingPushRemoval(room);
-      const current = pending ? await localSubscription(await registration.pushManager.getSubscription()) : subscription;
-      if (live) { setRemote(status); setPending(remaining); setLocal(current); }
+      const synchronized = saved.pending.length ? await synchronizePushRemoval(room, workspace) : undefined;
+      const status = synchronized ?? await mobileRequest<PushStatus>({ op: 'push-status', workspace }, room);
+      if (!live) return;
+      if (!synchronized) await rememberPushRegistration(room, status.endpointId);
+      const current = await localSubscription(await registration.pushManager.getSubscription());
+      const remaining = await phonePushState(room);
+      if (live) { setRemote(status); setSaved(remaining); setLocal(current); }
     })().catch(error => {
       if (live) setStatusError(error instanceof Error ? error.message : '暂时无法读取手机推送设置。');
     });
@@ -162,9 +189,12 @@ export function PhonePushSettings({ room, workspace, syncVersion }: { room: stri
         await worker.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
       setLocal(await localSubscription(subscription));
       try {
-        setRemote(await mobileRequest<PushStatus>({
+        const status = await mobileRequest<PushStatus>({
           op: 'push-subscribe', workspace, subscription: subscription.toJSON(),
-        }, room));
+        }, room);
+        if (!await rememberPushRegistration(room, status.endpointId)) throw new PairingChanged();
+        setRemote(status);
+        setSaved(await phonePushState(room));
       } catch (error) {
         // The permission prompt can outlive the pairing that supplied the application key.
         if (error instanceof PairingChanged && !existing) await subscription.unsubscribe();
@@ -174,15 +204,13 @@ export function PhonePushSettings({ room, workspace, syncVersion }: { room: stri
   }
 
   function disable() {
-    const endpointId = local?.id ?? remote?.endpointId;
-    if (!endpointId) return;
     void action.run(async () => {
-      if (!await savePushRemoval(room, endpointId)) throw new Error('此手机的配对已更换。');
-      setPending(endpointId);
+      if (!await queuePushRemoval(room, local?.id ?? null)) throw new PairingChanged();
+      setSaved(await phonePushState(room));
       const status = await synchronizePushRemoval(room, workspace);
       if (status) setRemote(status);
       setLocal(worker ? await localSubscription(await worker.pushManager.getSubscription()) : undefined);
-      setPending(await pendingPushRemoval(room));
+      setSaved(await phonePushState(room));
     });
   }
 
@@ -198,7 +226,7 @@ export function PhonePushSettings({ room, workspace, syncVersion }: { room: stri
         {!active && !oldSubscription && <button className="action" type="button"
           disabled={action.pending || denied || !!pending || !workspace || !remote || !worker}
           onClick={enable}>{local ? '重新连接手机推送' : '启用手机推送'}</button>}
-        {!pending && (local || remote?.registered) && <button className="action secondary" type="button"
+        {!pending && (local || remote?.registered || saved.endpointId) && <button className="action secondary" type="button"
           disabled={action.pending} onClick={disable}>{oldSubscription ? '移除旧订阅' : '停用手机推送'}</button>}
       </div>
     </>}

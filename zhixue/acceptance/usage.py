@@ -1,3 +1,4 @@
+from collections import Counter
 from datetime import UTC, datetime
 import json
 import os
@@ -5,10 +6,12 @@ from pathlib import Path
 import sqlite3
 from tempfile import NamedTemporaryFile
 
-from sqlalchemy import and_, create_engine, func, select
+from sqlalchemy import and_, create_engine, select
 
 from backend.db import ModelCharge, ModelRole, ModelUse, transaction
 from backend.model_ledger import charge_view, sum_usage, utc_clock
+
+from .report_files import replace_report
 
 
 ROLES = {"main": "主模型", "review": "独立复核模型"}
@@ -33,17 +36,19 @@ def read_usage(database: Path, *, final=False) -> dict:
             roles = {identity: ROLES[role] for role, identity in db.execute(
                 select(ModelRole.role, ModelRole.connection_id).where(ModelRole.role.in_(ROLES))
             )}
-            unsent_statuses = ("not_sent", "reserved")
-            unsent = dict(db.execute(
-                select(ModelUse.status, func.count())
-                .where(ModelUse.status.in_(unsent_statuses)).group_by(ModelUse.status)
-            ).all())
-            admitted = ModelUse.status.not_in(unsent_statuses)
+            unsent = Counter()
+            rows = []
             charges = ModelCharge.source == ModelUse.__tablename__
-            rows = db.execute(select(ModelUse, ModelCharge).outerjoin(
+            for use, charge in db.execute(select(ModelUse, ModelCharge).outerjoin(
                 ModelCharge, and_(charges, ModelCharge.call_id == ModelUse.id),
-            ).where(admitted).order_by(ModelUse.started_at, ModelUse.id)).all()
-            summary = sum_usage(db, charges, ModelCharge.call_id.in_(select(ModelUse.id).where(admitted)))
+            ).order_by(ModelUse.started_at, ModelUse.id)):
+                # Keep the transport's durable decision even if the Worker has not finished the task.
+                status = "not_sent" if charge is not None and charge.status == "not_sent" else use.status
+                if status in {"not_sent", "reserved"}:
+                    unsent[status] += 1
+                else:
+                    rows.append((use, charge))
+            summary = sum_usage(db, charges, ModelCharge.call_id.in_([use.id for use, _ in rows]))
             calls = []
             for use, charge in rows:
                 amount = charge_view(charge) if charge is not None else {}
@@ -86,7 +91,7 @@ def write_usage_checkpoint(path: Path, database: Path, *, final=False) -> None:
             file.flush()
             os.fsync(file.fileno())
             file.close()
-            temporary.replace(path)
+            replace_report(temporary, path)
         finally:
             file.close()
             temporary.unlink(missing_ok=True)
